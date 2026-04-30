@@ -1,8 +1,5 @@
 # 🌐 GoRelay Pro
 
-<p align="center">
-  <img src="https://gorelay.888021.xyz/logo.svg" alt="GoRelay Pro Logo" width="200"/>
-</p>
 
 <p align="center">
   <strong>安全、轻量、全能的分布式内网穿透与端口转发控制台</strong>
