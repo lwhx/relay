@@ -1,5 +1,5 @@
 <p align="right">
-   <a href="./README.en.md">English</a> | <strong>中文</strong>
+   <strong>English</strong> | <a href="./README.md">中文</a>
 </p>
 
 # 🌐 GoRelay Pro
