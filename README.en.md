@@ -45,8 +45,8 @@
 - [📚 Quick Start](#-quick-start)
 - [🔧 Deployment Guide](#-deployment-guide)
 - [🛠️ Common Commands](#️-common-commands)
-- [⚠️ FAQ](#-faq)
-- [🖥️ Interface Preview](#-interface-preview)
+- [⚠️ FAQ](# -faq)
+- [🖥️ Interface Preview](# -interface-preview)
 
 ---
 
