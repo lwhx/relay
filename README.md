@@ -290,21 +290,6 @@ tail -n 50 /var/log/relay.log
 
 <img width="800" height="592" alt="mmexport1778420608453" src="https://github.com/user-attachments/assets/d09da35a-dfb0-491b-8f93-7174dac3b916" />
 
-<p align="center">
-  <img width="1527" height="1123" alt="Dashboard" src="https://github.com/user-attachments/assets/d3db9e90-b3c5-4ddb-ad1a-c8c1b38537aa"/>
-</p>
-
-<p align="center">
-  <img width="1524" height="1116" alt="Nodes" src="https://github.com/user-attachments/assets/f23da23f-919e-40f5-ae53-025a1ddb9a9a"/>
-</p>
-
-<p align="center">
-  <img width="1521" height="1115" alt="Rules" src="https://github.com/user-attachments/assets/25248c27-a4dc-4700-89e5-44ac50e2551e"/>
-</p>
-
-<p align="center">
-  <img width="1583" height="1178" alt="Settings" src="https://github.com/user-attachments/assets/507cab32-c548-464e-9f85-4ac37f4d51b3"/>
-</p>
 
 ---
 
