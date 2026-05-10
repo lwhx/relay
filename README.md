@@ -288,6 +288,8 @@ tail -n 50 /var/log/relay.log
 
 ## 🖥️ 界面预览
 
+<img width="800" height="592" alt="mmexport1778420608453" src="https://github.com/user-attachments/assets/d09da35a-dfb0-491b-8f93-7174dac3b916" />
+
 <p align="center">
   <img width="1527" height="1123" alt="Dashboard" src="https://github.com/user-attachments/assets/d3db9e90-b3c5-4ddb-ad1a-c8c1b38537aa"/>
 </p>
