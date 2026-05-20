@@ -48,7 +48,7 @@ import (
 // --- 配置与常量 ---
 
 const (
-	AppVersion      = "v3.2.6"
+	AppVersion      = "v3.2.7"
 	DBFile          = "data.db"
 	WebPort         = ":8888"
 	DownloadURL     = "https://jht126.eu.org/https://github.com/jinhuaitao/relay/releases/latest/download/relay"
@@ -5166,6 +5166,15 @@ input:focus, select:focus {
 
     <div class="content" onscroll="document.querySelector('.main').classList.toggle('scrolled', this.scrollTop > 10)">
         <div id="dashboard" class="page active">
+            <!-- 欢迎横幅 -->
+            <div class="welcome-banner">
+                <div class="welcome-content">
+                    <div class="welcome-text">
+                        <h2>欢迎回来，{{.User}} 👋</h2>
+                        <p>这是你的 GoRelay Pro 控制面板，当前版本 {{.Version}}</p>
+                    </div>
+                </div>
+            </div>
             <div class="stats-grid">
                 <div class="card stat-item">
                     <div class="stat-label">累计总流量</div>
