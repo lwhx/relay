@@ -1479,6 +1479,7 @@ func runMaster() {
 	http.HandleFunc("/restart", authMiddleware(handleRestart))
 	http.HandleFunc("/update_sys", authMiddleware(handleUpdateSystem))
 	http.HandleFunc("/update_agent", authMiddleware(handleUpdateAgent))
+	http.HandleFunc("/update_all_agents", authMiddleware(handleUpdateAllAgents))
 	http.HandleFunc("/check_update", authMiddleware(handleCheckUpdate))
 	http.HandleFunc("/gen_agent_token", authMiddleware(handleGenAgentToken))
 	
@@ -2806,6 +2807,29 @@ func handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewEncoder(agent.Conn).Encode(Message{Type: "upgrade"})
 	w.Write([]byte("ok"))
+}
+
+func handleUpdateAllAgents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		return
+	}
+	
+	mu.Lock()
+	count := 0
+	// 遍历所有节点，仅向在线节点发送更新指令
+	for _, agent := range agents {
+		if agent.IsOnline {
+			json.NewEncoder(agent.Conn).Encode(Message{Type: "upgrade"})
+			count++
+		}
+	}
+	mu.Unlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true, 
+		"count":   count,
+	})
 }
 
 func handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
@@ -5447,7 +5471,10 @@ input:focus, select:focus {
             <div class="card">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
                     <h3 style="margin:0"><i class="ri-server-line"></i> 在线节点状态</h3>
-                    <button class="btn icon secondary" onclick="refreshSection('agents', this)" title="局部刷新"><i class="ri-refresh-line"></i></button>
+                    <div style="display:flex; gap: 8px;">
+                        <button class="btn warning" style="font-size:13px; padding: 6px 12px;" onclick="updateAllAgents()" title="一键更新所有在线节点"><i class="ri-rocket-line"></i> 全部更新</button>
+                        <button class="btn icon secondary" onclick="refreshSection('agents', this)" title="局部刷新"><i class="ri-refresh-line"></i></button>
+                    </div>
                 </div>
                 <div class="table-container" id="agents-container">
                     {{if .Agents}}
@@ -6144,6 +6171,25 @@ input:focus, select:focus {
     function updateAgent(name) {
         showConfirm("更新节点", "确定要远程更新节点 <b>"+name+"</b> 吗？", "warning", () => {
             fetch('/update_agent?name='+name, {method: 'POST'}).then(r => { if(r.ok) showToast("指令已发送", "success"); else showToast("发送失败", "warn"); });
+        });
+    }
+
+	function updateAllAgents() {
+        showConfirm("全部更新", "确定要远程更新 <b>所有在线节点</b> 吗？<br><br><span style='font-size:12px;color:var(--text-sub)'>这会导致所有节点的连接短暂中断，节点将自动下载最新版本并重启。</span>", "warning", () => {
+            fetch('/update_all_agents', {method: 'POST'})
+            .then(r => r.json())
+            .then(d => {
+                if(d.success) {
+                    if(d.count > 0) {
+                        showToast(`更新指令已发送至 ${d.count} 个在线节点`, "success");
+                    } else {
+                        showToast("当前没有在线的节点可更新", "warn");
+                    }
+                } else {
+                    showToast("发送失败", "warn");
+                }
+            })
+            .catch(() => showToast("请求发送失败", "warn"));
         });
     }
 
