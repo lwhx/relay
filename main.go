@@ -1675,14 +1675,27 @@ func broadcastLoop() {
 			continue
 		}
 		
-		// 1. 在循环外部，提前完成仅有一次的 JSON 序列化
+		// 1. 先构建好需要发送的消息对象 (这就是编译器之前找不到的 msg)
+		msg := WSMessage{
+			Type: "stats",
+			Data: WSDashboardData{
+				TotalTraffic: currentTx + currentRx,
+				SpeedTx:      speedTx,
+				SpeedRx:      speedRx,
+				Agents:       agentData,
+				Rules:        ruleData,
+				Logs:         logData,
+			},
+		}
+
+		// 2. 在锁内，循环外部完成且仅完成一次 JSON 序列化
 		msgBytes, err := json.Marshal(msg)
 		if err != nil {
 			wsMu.Unlock()
 			continue
 		}
 
-		// 2. 遍历客户端发送，直接写入序列化好的 []byte，避免底层重复反射解析
+		// 3. 遍历客户端发送原生 Byte 数据，极大节省 CPU 和内存分配
 		for client := range wsClients {
 			if err := client.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
 				client.Close()
