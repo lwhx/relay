@@ -34,6 +34,7 @@ import (
 	"syscall"
 	"time"
     "context" 
+	"golang.org/x/time/rate"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
@@ -48,7 +49,7 @@ import (
 // --- 配置与常量 ---
 
 const (
-	AppVersion      = "v3.2.7"
+	AppVersion      = "v3.2.8"
 	DBFile          = "data.db"
 	WebPort         = ":8888"
 	DownloadURL     = "https://jht126.eu.org/https://github.com/jinhuaitao/relay/releases/latest/download/relay"
@@ -1674,19 +1675,17 @@ func broadcastLoop() {
 			wsMu.Unlock()
 			continue
 		}
-		msg := WSMessage{
-			Type: "stats",
-			Data: WSDashboardData{
-				TotalTraffic: currentTx + currentRx,
-				SpeedTx:      speedTx,
-				SpeedRx:      speedRx,
-				Agents:       agentData,
-				Rules:        ruleData,
-				Logs:         logData,
-			},
+		
+		// 1. 在循环外部，提前完成仅有一次的 JSON 序列化
+		msgBytes, err := json.Marshal(msg)
+		if err != nil {
+			wsMu.Unlock()
+			continue
 		}
+
+		// 2. 遍历客户端发送，直接写入序列化好的 []byte，避免底层重复反射解析
 		for client := range wsClients {
-			if err := client.WriteJSON(msg); err != nil {
+			if err := client.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
 				client.Close()
 				delete(wsClients, client)
 			}
@@ -1840,40 +1839,45 @@ func handleStatsReport(payload interface{}) {
 	mu.Lock()
 	defer mu.Unlock()
 	limitTriggered := false
+
+	// 构建 O(1) 快速索引映射，消除 O(N*M) 的双层嵌套遍历
+	ruleIndex := make(map[string]int, len(rules))
+	for i := range rules {
+		ruleIndex[rules[i].ID] = i
+	}
+
 	for _, rep := range reports {
 		if strings.HasSuffix(rep.TaskID, "_entry") {
 			rid := strings.TrimSuffix(rep.TaskID, "_entry")
-			for i := range rules {
-				if rules[i].ID == rid {
-					rules[i].TotalTx += rep.TxDelta
-					rules[i].TotalRx += rep.RxDelta
-					rules[i].UserCount = rep.UserCount
-					atomic.StoreInt32(&configDirty, 1)
+			
+			// 使用哈希映射直接定位规则
+			if i, exists := ruleIndex[rid]; exists {
+				rules[i].TotalTx += rep.TxDelta
+				rules[i].TotalRx += rep.RxDelta
+				rules[i].UserCount = rep.UserCount
+				atomic.StoreInt32(&configDirty, 1)
 
-					// 将增量数据记录到每日流量统计缓冲池中
-					atomic.AddInt64(&dailyTxBuf, rep.TxDelta)
-					atomic.AddInt64(&dailyRxBuf, rep.RxDelta)
+				atomic.AddInt64(&dailyTxBuf, rep.TxDelta)
+				atomic.AddInt64(&dailyRxBuf, rep.RxDelta)
 
-					// --- 智能预警机制开始 ---
-					limit := rules[i].TrafficLimit
-					total := rules[i].TotalTx + rules[i].TotalRx
-					if limit > 0 {
-						pct := float64(total) / float64(limit)
-						if pct >= 1.0 && !rules[i].Alert100 {
-							rules[i].Alert100 = true
-							sendTelegram(fmt.Sprintf("🚨 <b>流量耗尽熔断</b>\n\n规则：【%s】\n状态：已切断连接\n说明：流量达到 100%%，为了您的钱包安全，该端口已自动熔断！", rules[i].Note))
-							limitTriggered = true
-						} else if pct >= 0.95 && pct < 1.0 && !rules[i].Alert95 {
-							rules[i].Alert95 = true
-							sendTelegram(fmt.Sprintf("⚠️ <b>流量极高预警</b>\n\n规则：【%s】\n状态：即将熔断\n说明：流量已使用超过 95%%，请及时检查或重置流量！", rules[i].Note))
-						} else if pct >= 0.80 && pct < 0.95 && !rules[i].Alert80 {
-							rules[i].Alert80 = true
-							sendTelegram(fmt.Sprintf("🔔 <b>流量使用预警</b>\n\n规则：【%s】\n状态：运行中\n说明：流量已使用超过 80%%。", rules[i].Note))
-						}
+				// --- 智能预警机制开始 ---
+				limit := rules[i].TrafficLimit
+				total := rules[i].TotalTx + rules[i].TotalRx
+				if limit > 0 {
+					pct := float64(total) / float64(limit)
+					if pct >= 1.0 && !rules[i].Alert100 {
+						rules[i].Alert100 = true
+						sendTelegram(fmt.Sprintf("🚨 <b>流量耗尽熔断</b>\n\n规则：【%s】\n状态：已切断连接\n说明：流量达到 100%%，该端口已自动熔断！", rules[i].Note))
+						limitTriggered = true
+					} else if pct >= 0.95 && pct < 1.0 && !rules[i].Alert95 {
+						rules[i].Alert95 = true
+						sendTelegram(fmt.Sprintf("⚠️ <b>流量极高预警</b>\n\n规则：【%s】\n状态：即将熔断\n说明：流量已使用超过 95%%！", rules[i].Note))
+					} else if pct >= 0.80 && pct < 0.95 && !rules[i].Alert80 {
+						rules[i].Alert80 = true
+						sendTelegram(fmt.Sprintf("🔔 <b>流量使用预警</b>\n\n规则：【%s】\n状态：运行中\n说明：流量已使用超过 80%%。", rules[i].Note))
 					}
-					// --- 智能预警机制结束 ---
-					break
 				}
+				// --- 智能预警机制结束 ---
 			}
 		}
 	}
@@ -3404,19 +3408,26 @@ func copyCount(dst io.Writer, src io.Reader, c *int64, limit int64) {
 	bufPtr := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufPtr)
 	buf := *bufPtr
+
+	// 初始化官方令牌桶限速器
+	var limiter *rate.Limiter
+	if limit > 0 {
+		// Limit(limit) 表示每秒允许的字节数，Burst 设为 32KB 应对缓冲区突发
+		limiter = rate.NewLimiter(rate.Limit(limit), 32*1024)
+	}
+
+	ctx := context.Background()
 	for {
 		nr, err := src.Read(buf)
 		if nr > 0 {
-			start := time.Now()
+			// 如果开启了限速，平滑消费令牌，替代粗暴的 time.Sleep
+			if limiter != nil {
+				_ = limiter.WaitN(ctx, nr)
+			}
+			
 			nw, _ := dst.Write(buf[0:nr])
 			if nw > 0 {
 				atomic.AddInt64(c, int64(nw))
-			}
-			if limit > 0 {
-				exp := time.Duration(1e9 * int64(nr) / limit)
-				if act := time.Since(start); exp > act {
-					time.Sleep(exp - act)
-				}
 			}
 		}
 		if err != nil {
