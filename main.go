@@ -6181,7 +6181,8 @@ input:focus, select:focus {
             .then(d => {
                 if(d.success) {
                     if(d.count > 0) {
-                        showToast(`更新指令已发送至 ${d.count} 个在线节点`, "success");
+                        // 【修复点】：使用普通双引号拼接，避免打断 Go 的反引号常量
+                        showToast("更新指令已发送至 " + d.count + " 个在线节点", "success");
                     } else {
                         showToast("当前没有在线的节点可更新", "warn");
                     }
