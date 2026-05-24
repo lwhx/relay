@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
@@ -32,23 +33,22 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-    "context" 
-	"golang.org/x/time/rate"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/boombuler/barcode"
 	"github.com/boombuler/barcode/qr"
 	"github.com/gorilla/websocket"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/time/rate"
 	_ "modernc.org/sqlite"
 )
 
 // --- 配置与常量 ---
 
 const (
-	AppVersion      = "v3.2.8"
+	AppVersion      = "v3.2.9"
 	DBFile          = "data.db"
 	WebPort         = ":8888"
 	DownloadURL     = "https://jht126.eu.org/https://github.com/jinhuaitao/relay/releases/latest/download/relay"
@@ -92,11 +92,11 @@ type LogicalRule struct {
 	TargetStatus  bool  `json:"-"`
 	TargetLatency int64 `json:"-"`
 
-	Alert80  bool `json:"alert_80"`
-	Alert95  bool `json:"alert_95"`
-	Alert100 bool `json:"alert_100"`
-	BridgeLatency int64 `json:"-"`
-	EntryIP string `json:"-"`
+	Alert80       bool   `json:"alert_80"`
+	Alert95       bool   `json:"alert_95"`
+	Alert100      bool   `json:"alert_100"`
+	BridgeLatency int64  `json:"-"`
+	EntryIP       string `json:"-"`
 }
 
 type OpLog struct {
@@ -131,7 +131,7 @@ type AppConfig struct {
 	GithubAllowedUsers string            `json:"github_allowed_users"`
 	TrafficResetDay    int               `json:"traffic_reset_day"`
 	LastResetMonth     string            `json:"last_reset_month"`
-    R2AccessKey        string            `json:"r2_access_key"`
+	R2AccessKey        string            `json:"r2_access_key"`
 	R2SecretKey        string            `json:"r2_secret_key"`
 	R2Endpoint         string            `json:"r2_endpoint"`
 	R2Bucket           string            `json:"r2_bucket"`
@@ -161,14 +161,14 @@ type HealthReport struct {
 }
 
 type AgentInfo struct {
-	Name      string   `json:"name"`
-	RemoteIP  string   `json:"remote_ip"`
-	Conn      net.Conn `json:"-"`
-	SysStatus string   `json:"sys_status"`
+	Name        string    `json:"name"`
+	RemoteIP    string    `json:"remote_ip"`
+	Conn        net.Conn  `json:"-"`
+	SysStatus   string    `json:"sys_status"`
 	ConnectedAt time.Time `json:"-"`
-    Version     string    `json:"version"`
-    Region      string    `json:"region"`
-    IsOnline    bool      `json:"is_online"`
+	Version     string    `json:"version"`
+	Region      string    `json:"region"`
+	IsOnline    bool      `json:"is_online"`
 }
 
 type Message struct {
@@ -203,21 +203,21 @@ type WSDashboardData struct {
 type AgentStatusData struct {
 	Name      string `json:"name"`
 	SysStatus string `json:"sys_status"`
-    IsOnline  bool   `json:"is_online"`
+	IsOnline  bool   `json:"is_online"`
 }
 
 type RuleStatusData struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-    Group     string `json:"group"`
-	Total     int64  `json:"total"`
-	Tx        int64  `json:"tx"`
-	Rx        int64  `json:"rx"`
-	UserCount int64  `json:"uc"`
-	Limit     int64  `json:"limit"`
-	Status    bool   `json:"status"`
-	Latency   int64  `json:"latency"`
-	BridgeLatency int64 `json:"bridge_latency"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Group         string `json:"group"`
+	Total         int64  `json:"total"`
+	Tx            int64  `json:"tx"`
+	Rx            int64  `json:"rx"`
+	UserCount     int64  `json:"uc"`
+	Limit         int64  `json:"limit"`
+	Status        bool   `json:"status"`
+	Latency       int64  `json:"latency"`
+	BridgeLatency int64  `json:"bridge_latency"`
 }
 
 var (
@@ -225,7 +225,7 @@ var (
 	config           AppConfig
 	agents           = make(map[string]*AgentInfo)
 	rules            = make([]LogicalRule, 0)
-	mu               sync.Mutex
+	mu               sync.RWMutex // 已优化：升级为读写锁
 	runningListeners sync.Map
 	activeTasks      sync.Map
 	activeTargets    sync.Map
@@ -255,6 +255,10 @@ var (
 	// 每日流量统计缓冲（提升数据库性能）
 	dailyTxBuf int64
 	dailyRxBuf int64
+
+	// 已优化：日志内存级缓存
+	recentLogs []OpLog
+	logMu      sync.RWMutex
 )
 
 // --- 数据库初始化与优化 ---
@@ -481,7 +485,7 @@ func getSysStatus() string {
 					for i := 1; i < len(fields) && i <= 8; i++ {
 						ticks[i-1], _ = strconv.ParseUint(fields[i], 10, 64)
 					}
-					idleTicks := ticks[3] + ticks[4] 
+					idleTicks := ticks[3] + ticks[4]
 					var totalTicks uint64
 					for _, t := range ticks {
 						totalTicks += t
@@ -507,11 +511,21 @@ func getSysStatus() string {
 				fields := strings.Fields(line)
 				if len(fields) >= 2 {
 					val, _ := strconv.ParseUint(fields[1], 10, 64)
-					if fields[0] == "MemTotal:" { total = val }
-					if fields[0] == "MemAvailable:" { available = val }
-					if fields[0] == "MemFree:" { free = val }
-					if fields[0] == "Buffers:" { buffers = val }
-					if fields[0] == "Cached:" { cached = val }
+					if fields[0] == "MemTotal:" {
+						total = val
+					}
+					if fields[0] == "MemAvailable:" {
+						available = val
+					}
+					if fields[0] == "MemFree:" {
+						free = val
+					}
+					if fields[0] == "Buffers:" {
+						buffers = val
+					}
+					if fields[0] == "Cached:" {
+						cached = val
+					}
 				}
 			}
 			if total > 0 {
@@ -527,7 +541,7 @@ func getSysStatus() string {
 		var stat syscall.Statfs_t
 		if err := syscall.Statfs("/", &stat); err == nil {
 			used := stat.Blocks - stat.Bfree
-			nonRootTotal := used + stat.Bavail 
+			nonRootTotal := used + stat.Bavail
 			if nonRootTotal > 0 {
 				diskPct = (float64(used) / float64(nonRootTotal)) * 100.0
 			}
@@ -535,13 +549,25 @@ func getSysStatus() string {
 	} else {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
-		memPct = 1.0 
-		cpuPct = float64(runtime.NumGoroutine()) 
+		memPct = 1.0
+		cpuPct = float64(runtime.NumGoroutine())
 	}
 
-	if cpuPct < 0 { cpuPct = 0 } else if cpuPct > 100 { cpuPct = 100 }
-	if memPct < 0 { memPct = 0 } else if memPct > 100 { memPct = 100 }
-	if diskPct < 0 { diskPct = 0 } else if diskPct > 100 { diskPct = 100 }
+	if cpuPct < 0 {
+		cpuPct = 0
+	} else if cpuPct > 100 {
+		cpuPct = 100
+	}
+	if memPct < 0 {
+		memPct = 0
+	} else if memPct > 100 {
+		memPct = 100
+	}
+	if diskPct < 0 {
+		diskPct = 0
+	} else if diskPct > 100 {
+		diskPct = 100
+	}
 
 	return fmt.Sprintf("CPU:%.1f|MEM:%.1f|DSK:%.1f", cpuPct, memPct, diskPct)
 }
@@ -561,12 +587,20 @@ func getClientIP(r *http.Request) string {
 	return ip
 }
 
+// 已优化：日志操作直接写入内存与 DB
 func addLog(r *http.Request, action, msg string) {
 	ip := getClientIP(r)
 	now := time.Now().Format("01-02 15:04:05")
 	if db != nil {
 		_, _ = db.Exec("INSERT INTO logs (time, ip, action, msg) VALUES (?,?,?,?)", now, ip, action, msg)
 	}
+
+	logMu.Lock()
+	recentLogs = append([]OpLog{{Time: now, IP: ip, Action: action, Msg: msg}}, recentLogs...)
+	if len(recentLogs) > MaxLogEntries {
+		recentLogs = recentLogs[:MaxLogEntries]
+	}
+	logMu.Unlock()
 }
 
 func addSystemLog(ip, action, msg string) {
@@ -574,6 +608,13 @@ func addSystemLog(ip, action, msg string) {
 	if db != nil {
 		_, _ = db.Exec("INSERT INTO logs (time, ip, action, msg) VALUES (?,?,?,?)", now, ip, action, msg)
 	}
+
+	logMu.Lock()
+	recentLogs = append([]OpLog{{Time: now, IP: ip, Action: action, Msg: msg}}, recentLogs...)
+	if len(recentLogs) > MaxLogEntries {
+		recentLogs = recentLogs[:MaxLogEntries]
+	}
+	logMu.Unlock()
 }
 
 func handleService(op, mode, name, connect, token string, useTLS bool) {
@@ -673,9 +714,9 @@ func doSelfUninstall() {
 // ================= TG BOT INTERACTIVE =================
 
 func tgRequest(method string, payload interface{}) {
-	mu.Lock()
+	mu.RLock()
 	token := config.TgBotToken
-	mu.Unlock()
+	mu.RUnlock()
 	if token == "" {
 		return
 	}
@@ -691,9 +732,9 @@ func tgRequest(method string, payload interface{}) {
 }
 
 func sendTelegram(text string) {
-	mu.Lock()
+	mu.RLock()
 	chatID := config.TgChatID
-	mu.Unlock()
+	mu.RUnlock()
 	if chatID == "" {
 		return
 	}
@@ -714,30 +755,29 @@ func makeAestheticBar(percent float64, fillChar, emptyChar string) string {
 	if percent > 100 {
 		percent = 100
 	}
-	
+
 	totalWidth := 12 // 12格是极简符号的视觉黄金比例
-	
+
 	filledBlocks := int((percent / 100.0) * float64(totalWidth))
-	
+
 	// 保证只要有占用，就至少亮起一格，避免 1% 显示为空
 	if percent > 0 && filledBlocks == 0 {
-		filledBlocks = 1 
+		filledBlocks = 1
 	}
 	if filledBlocks > totalWidth {
 		filledBlocks = totalWidth
 	}
-	
+
 	emptyBlocks := totalWidth - filledBlocks
-	
+
 	return strings.Repeat(fillChar, filledBlocks) + strings.Repeat(emptyChar, emptyBlocks)
 }
 
-
 // 向 Telegram 自动注册原生快捷菜单 (Menu Button)
 func setupTgBotCommands() {
-	mu.Lock()
+	mu.RLock()
 	token := config.TgBotToken
-	mu.Unlock()
+	mu.RUnlock()
 	if token == "" {
 		return
 	}
@@ -761,10 +801,10 @@ func setupTgBotCommands() {
 
 // --- TG 云备份功能核心 ---
 func sendTelegramDocument(filePath string, caption string) {
-	mu.Lock()
+	mu.RLock()
 	token := config.TgBotToken
 	chatID := config.TgChatID
-	mu.Unlock()
+	mu.RUnlock()
 	if token == "" || chatID == "" {
 		return
 	}
@@ -801,12 +841,12 @@ func sendTelegramDocument(filePath string, caption string) {
 }
 
 func uploadToR2(filePath string) error {
-	mu.Lock()
+	mu.RLock()
 	ak := config.R2AccessKey
 	sk := config.R2SecretKey
 	endpoint := config.R2Endpoint
 	bucket := config.R2Bucket
-	mu.Unlock()
+	mu.RUnlock()
 
 	// 如果没有配置，就不执行备份
 	if ak == "" || sk == "" || endpoint == "" || bucket == "" {
@@ -832,7 +872,7 @@ func uploadToR2(filePath string) error {
 
 	// 文件名带上时间戳：gorelay_backup_20260412_120000.db
 	fileName := fmt.Sprintf("gorelay_backup_%s.db", time.Now().Format("20060102_150405"))
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -848,10 +888,10 @@ func autoBackupLoop() {
 		time.Sleep(1 * time.Hour)
 		now := time.Now()
 
-		mu.Lock()
+		mu.RLock()
 		token := config.TgBotToken
 		chatID := config.TgChatID
-		mu.Unlock()
+		mu.RUnlock()
 
 		if token == "" || chatID == "" {
 			continue
@@ -862,7 +902,7 @@ func autoBackupLoop() {
 		if now.Weekday() == time.Monday && now.Hour() == 2 && lastBackupWeek != week {
 			lastBackupWeek = week
 			sendTelegramDocument(DBFile, fmt.Sprintf("☁️ <b>自动云备份</b>\n\n这是本周的系统数据备份。\n时间: %s", now.Format("2006-01-02 15:04:05")))
-			
+
 			// === 触发 R2 备份 ===
 			if err := uploadToR2(DBFile); err == nil {
 				sendTelegram("✅ <b>R2 容灾备份成功</b>\n数据库已安全同步至 Cloudflare R2。")
@@ -897,8 +937,8 @@ func sendTgMenu(chatID string) {
 
 func buildRulesMenuMarkup(page int) map[string]interface{} {
 	var rows [][]InlineButton
-	mu.Lock()
-	defer mu.Unlock()
+	mu.RLock()
+	defer mu.RUnlock()
 
 	pageSize := 10 // 每页显示的规则数量
 	totalRules := len(rules)
@@ -953,10 +993,10 @@ func buildRulesMenuMarkup(page int) map[string]interface{} {
 func startTgBotLoop() {
 	var offset int64 = 0
 	for {
-		mu.Lock()
+		mu.RLock()
 		token := config.TgBotToken
 		allowedChat := config.TgChatID
-		mu.Unlock()
+		mu.RUnlock()
 
 		if token == "" || allowedChat == "" {
 			time.Sleep(10 * time.Second)
@@ -1079,7 +1119,9 @@ func startTgBotLoop() {
 						},
 					}
 					tgAction := "editMessageText"
-					if msgID == 0 { tgAction = "sendMessage" }
+					if msgID == 0 {
+						tgAction = "sendMessage"
+					}
 					tgRequest(tgAction, map[string]interface{}{
 						"chat_id":      chatIdStr,
 						"message_id":   msgID,
@@ -1088,14 +1130,14 @@ func startTgBotLoop() {
 						"reply_markup": markup,
 					})
 				} else if data == "cmd:status" {
-					mu.Lock()
+					mu.RLock()
 					var tx, rx int64
 					for _, r := range rules {
 						tx += r.TotalTx
 						rx += r.TotalRx
 					}
 					reply := fmt.Sprintf("📊 <b>系统实时状态</b>\n\n🌐 总中继流量: <b>%s</b>\n🔌 在线节点数: <b>%d</b>\n📜 转发规则数: <b>%d</b>\n\n--- 探针状态 ---\n", formatBytes(tx+rx), len(agents), len(rules))
-					
+
 					// === 新增 TG 节点排序逻辑 ===
 					var sortedAgents []*AgentInfo
 					for _, a := range agents {
@@ -1125,9 +1167,15 @@ func startTgBotLoop() {
 							kv := strings.Split(p, ":")
 							if len(kv) == 2 {
 								v, _ := strconv.ParseFloat(kv[1], 64)
-								if kv[0] == "CPU" { cpu = v }
-								if kv[0] == "MEM" { mem = v }
-								if kv[0] == "DSK" { dsk = v }
+								if kv[0] == "CPU" {
+									cpu = v
+								}
+								if kv[0] == "MEM" {
+									mem = v
+								}
+								if kv[0] == "DSK" {
+									dsk = v
+								}
 							}
 						}
 						reply += fmt.Sprintf("💻 <b>%s</b> <code>[%s]</code> (🟢 在线)\n", a.Name, a.RemoteIP)
@@ -1138,41 +1186,45 @@ func startTgBotLoop() {
 					if len(agents) == 0 {
 						reply += "⚠️ <i>暂无节点在线</i>\n\n"
 					}
-					mu.Unlock()
+					mu.RUnlock()
 
 					// 查询近 30 天流量消耗趋势
 					reply += "--- 历史流量趋势 ---\n"
-					
+
 					var total30Tx, total30Rx int64
 					var historyLines []string
 					if db != nil {
 						dsRows, err := db.Query("SELECT date, tx, rx FROM daily_stats ORDER BY date DESC LIMIT 30")
 						if err == nil {
 							defer dsRows.Close()
-							
+
 							for dsRows.Next() {
 								var d string
 								var dTx, dRx int64
 								dsRows.Scan(&d, &dTx, &dRx)
 								total30Tx += dTx
 								total30Rx += dRx
-								
+
 								if len(historyLines) < 10 {
 									shortDate := d
-									if len(d) == 10 { shortDate = d[5:] }
+									if len(d) == 10 {
+										shortDate = d[5:]
+									}
 									historyLines = append(historyLines, fmt.Sprintf("📅 %s ⬆️%s ⬇️%s", shortDate, formatBytes(dTx), formatBytes(dRx)))
 								}
 							}
 						}
 					}
-					
+
 					if len(historyLines) > 0 {
 						reply += fmt.Sprintf("🗓️ <b>近 30 天总计: %s</b>\n", formatBytes(total30Tx+total30Rx))
-						for _, line := range historyLines { reply += line + "\n" }
+						for _, line := range historyLines {
+							reply += line + "\n"
+						}
 					} else {
 						reply += "<i>暂无历史流量数据</i>\n"
 					}
-					
+
 					nowTime := time.Now().Format("2006-01-02 15:04:05")
 					reply += fmt.Sprintf("\n<blockquote expandable>🕒 探针最后同步时间: \n<code>%s</code></blockquote>", nowTime)
 
@@ -1180,7 +1232,9 @@ func startTgBotLoop() {
 						"inline_keyboard": [][]InlineButton{{{Text: "🔙 返回主菜单", CallbackData: "cmd:menu"}, {Text: "🔄 刷新状态", CallbackData: "cmd:status"}}},
 					}
 					tgAction := "editMessageText"
-					if msgID == 0 { tgAction = "sendMessage" }
+					if msgID == 0 {
+						tgAction = "sendMessage"
+					}
 					tgRequest(tgAction, map[string]interface{}{
 						"chat_id":      chatIdStr,
 						"message_id":   msgID,
@@ -1197,7 +1251,9 @@ func startTgBotLoop() {
 						}
 					}
 					tgAction := "editMessageText"
-					if msgID == 0 { tgAction = "sendMessage" }
+					if msgID == 0 {
+						tgAction = "sendMessage"
+					}
 					tgRequest(tgAction, map[string]interface{}{
 						"chat_id":      chatIdStr,
 						"message_id":   msgID,
@@ -1209,7 +1265,7 @@ func startTgBotLoop() {
 					go func() {
 						// 1. 先发送到 Telegram
 						sendTelegramDocument(DBFile, fmt.Sprintf("☁️ <b>手动云备份</b>\n\n数据库文件已成功导出。\n时间: %s", time.Now().Format("2006-01-02 15:04:05")))
-						
+
 						// 2. 触发 Cloudflare R2 备份
 						if err := uploadToR2(DBFile); err == nil {
 							sendTelegram("✅ <b>R2 容灾备份成功</b>\n手动触发的备份已同步至 Cloudflare R2。")
@@ -1227,7 +1283,7 @@ func startTgBotLoop() {
 							p, _ := strconv.Atoi(parts[2])
 							page = p
 						}
-						
+
 						mu.Lock()
 						for i := range rules {
 							if rules[i].ID == id {
@@ -1283,11 +1339,11 @@ func startTgBotLoop() {
 func trafficResetLoop() {
 	for {
 		time.Sleep(1 * time.Hour)
-		
-		mu.Lock()
+
+		mu.RLock()
 		day := config.TrafficResetDay
 		lastM := config.LastResetMonth
-		mu.Unlock()
+		mu.RUnlock()
 
 		if day <= 0 || day > 31 {
 			continue
@@ -1295,7 +1351,7 @@ func trafficResetLoop() {
 
 		now := time.Now()
 		currentM := now.Format("2006-01")
-		
+
 		if now.Day() >= day && lastM != currentM {
 			mu.Lock()
 			for i := range rules {
@@ -1308,13 +1364,12 @@ func trafficResetLoop() {
 			config.LastResetMonth = currentM
 			saveConfigNoLock()
 			mu.Unlock()
-			
+
 			sendTelegram(fmt.Sprintf("📅 <b>账单日触发</b>\n系统已自动清零本月所有规则的流量统计！"))
 			go pushConfigToAll()
 		}
 	}
 }
-
 
 // ================= MASTER =================
 
@@ -1353,6 +1408,26 @@ func dailyTrafficReportLoop() {
 // ================= MASTER =================
 
 func runMaster() {
+	// === 已优化：启动时预加载日志到内存 ===
+	initDB()
+	loadConfig()
+
+	if db != nil {
+		rows, err := db.Query("SELECT time, ip, action, msg FROM logs ORDER BY id DESC LIMIT ?", MaxLogEntries)
+		if err == nil {
+			logMu.Lock()
+			recentLogs = make([]OpLog, 0, MaxLogEntries)
+			for rows.Next() {
+				var l OpLog
+				rows.Scan(&l.Time, &l.IP, &l.Action, &l.Msg)
+				recentLogs = append(recentLogs, l)
+			}
+			logMu.Unlock()
+			rows.Close()
+		}
+	}
+	// ===================================
+
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		for range ticker.C {
@@ -1367,19 +1442,19 @@ func runMaster() {
 		}
 	}()
 	go broadcastLoop()
-	go startTgBotLoop()   
-	go autoBackupLoop()   
+	go startTgBotLoop()
+	go autoBackupLoop()
 	go trafficResetLoop()
 	go dailyTrafficReportLoop()
 
-	mu.Lock()
+	mu.RLock()
 	panelDomain := config.PanelDomain
 	nodeDomain := config.MasterDomain
 	portsStr := config.AgentPorts
 	if portsStr == "" {
 		portsStr = "9999"
 	}
-	mu.Unlock()
+	mu.RUnlock()
 
 	var tlsConfig *tls.Config
 	isMasterTLS = false
@@ -1438,7 +1513,7 @@ func runMaster() {
 				log.Printf("❌ 监听端口 %s 失败: %v", p, err)
 				return
 			}
-			
+
 			if isMasterTLS {
 				log.Printf("✅ Agent 监听端口启动 (安全 TLS 模式): %s", p)
 			} else {
@@ -1482,19 +1557,19 @@ func runMaster() {
 	http.HandleFunc("/update_all_agents", authMiddleware(handleUpdateAllAgents))
 	http.HandleFunc("/check_update", authMiddleware(handleCheckUpdate))
 	http.HandleFunc("/gen_agent_token", authMiddleware(handleGenAgentToken))
-	
+
 	http.HandleFunc("/oauth/github/login", handleGithubLogin)
 	http.HandleFunc("/oauth/github/callback", handleGithubCallback)
-	
+
 	http.HandleFunc("/manifest.json", handleManifest)
 	http.HandleFunc("/sw.js", handleServiceWorker)
 	http.HandleFunc("/icon.svg", handleIcon)
 
 	webHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
+		mu.RLock()
 		pDomain := config.PanelDomain
 		nDomain := config.MasterDomain
-		mu.Unlock()
+		mu.RUnlock()
 
 		if pDomain != "" && nDomain != "" && pDomain != nDomain {
 			host := r.Host
@@ -1520,7 +1595,7 @@ func runMaster() {
 			TLSConfig: tlsConfig,
 			Handler:   webHandler,
 		}
-		log.Fatal(server.ListenAndServeTLS("", "")) 
+		log.Fatal(server.ListenAndServeTLS("", ""))
 	} else {
 		log.Printf("🚀 控制面板启动 (普通 HTTP): http://localhost%s", WebPort)
 		server := &http.Server{
@@ -1602,7 +1677,7 @@ func broadcastLoop() {
 	var lastTotalRx int64 = 0
 
 	for range ticker.C {
-		mu.Lock()
+		mu.RLock() // 已优化：读写锁
 		var currentTx, currentRx int64
 		var agentData []AgentStatusData
 		var ruleData []RuleStatusData
@@ -1622,38 +1697,37 @@ func broadcastLoop() {
 		for _, a := range agentList {
 			agentData = append(agentData, AgentStatusData{Name: a.Name, SysStatus: a.SysStatus, IsOnline: a.IsOnline})
 		}
-		
+
 		for _, r := range rules {
 			currentTx += r.TotalTx
 			currentRx += r.TotalRx
 			ruleData = append(ruleData, RuleStatusData{
-				ID:        r.ID,
-				Name:      r.Note,
-                Group:     r.Group,
-				Total:     r.TotalTx + r.TotalRx,
-				Tx:        r.TotalTx,
-				Rx:        r.TotalRx,
-				UserCount: r.UserCount,
-				Limit:     r.TrafficLimit,
-				Status:    r.TargetStatus,
-				Latency:   r.TargetLatency,
+				ID:            r.ID,
+				Name:          r.Note,
+				Group:         r.Group,
+				Total:         r.TotalTx + r.TotalRx,
+				Tx:            r.TotalTx,
+				Rx:            r.TotalRx,
+				UserCount:     r.UserCount,
+				Limit:         r.TrafficLimit,
+				Status:        r.TargetStatus,
+				Latency:       r.TargetLatency,
 				BridgeLatency: r.BridgeLatency,
 			})
 		}
-		mu.Unlock()
+		mu.RUnlock()
 
+		// === 已优化：直接从内存缓存读取最新的日志，脱离 DB ===
 		var logData []OpLog
-		if db != nil {
-			lRows, err := db.Query("SELECT time, ip, action, msg FROM logs ORDER BY id DESC LIMIT 15")
-			if err == nil {
-				for lRows.Next() {
-					var l OpLog
-					lRows.Scan(&l.Time, &l.IP, &l.Action, &l.Msg)
-					logData = append(logData, l)
-				}
-				lRows.Close()
-			}
+		logMu.RLock()
+		limit := 15
+		if len(recentLogs) < 15 {
+			limit = len(recentLogs)
 		}
+		logData = make([]OpLog, limit)
+		copy(logData, recentLogs[:limit])
+		logMu.RUnlock()
+		// ====================================================
 
 		var speedTx int64 = 0
 		var speedRx int64 = 0
@@ -1675,8 +1749,8 @@ func broadcastLoop() {
 			wsMu.Unlock()
 			continue
 		}
-		
-		// 1. 先构建好需要发送的消息对象 (这就是编译器之前找不到的 msg)
+
+		// 1. 先构建好需要发送的消息对象
 		msg := WSMessage{
 			Type: "stats",
 			Data: WSDashboardData{
@@ -1726,19 +1800,19 @@ func handleAgentConn(conn net.Conn) {
 	reportedIPv6, _ := data["ipv6"].(string)
 	testPortFloat, _ := data["test_port"].(float64)
 	testPort := int(testPortFloat)
-    reportedVersion, _ := data["version"].(string)
+	reportedVersion, _ := data["version"].(string)
 	if reportedVersion == "" {
 		reportedVersion = "未知"
 	}
 	// --------------------------------------
 
-	mu.Lock()
+	mu.RLock()
 	globalTk := config.AgentToken
 	var agentTk string
 	if config.AgentTokens != nil {
 		agentTk = config.AgentTokens[name]
 	}
-	mu.Unlock()
+	mu.RUnlock()
 
 	if reqToken == "" || name == "" {
 		return
@@ -1750,7 +1824,7 @@ func handleAgentConn(conn net.Conn) {
 	}
 
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-	
+
 	// --- 新增：智能入站连通性测试 (优先全功能 IPv4，备用全功能 IPv6) ---
 	finalIP := remoteIP
 	if testPort > 0 {
@@ -1793,7 +1867,9 @@ func handleAgentConn(conn net.Conn) {
 		// 使用免费接口查询 IP 信息
 		if resp, err := client.Get("http://ip-api.com/json/" + host + "?fields=countryCode"); err == nil {
 			defer resp.Body.Close()
-			var res struct{ CountryCode string `json:"countryCode"` }
+			var res struct {
+				CountryCode string `json:"countryCode"`
+			}
 			if json.NewDecoder(resp.Body).Decode(&res) == nil && len(res.CountryCode) == 2 {
 				cc := strings.ToUpper(res.CountryCode)
 				// 巧妙利用 Unicode 偏移量将两位字母转为国旗 Emoji (例如 US 会变成 🇺🇸)
@@ -1834,7 +1910,7 @@ func handleAgentConn(conn net.Conn) {
 	}
 	mu.Lock()
 	if curr, ok := agents[name]; ok && curr.Conn == conn {
-		curr.IsOnline = false  // <--- 修改这里：不删除，仅标记离线
+		curr.IsOnline = false // <--- 修改这里：不删除，仅标记离线
 		mu.Unlock()
 		sendTelegram(fmt.Sprintf("🔴 节点下线通知\n名称: %s", name))
 		// === 新增：将节点下线事件写入系统日志 ===
@@ -1862,7 +1938,7 @@ func handleStatsReport(payload interface{}) {
 	for _, rep := range reports {
 		if strings.HasSuffix(rep.TaskID, "_entry") {
 			rid := strings.TrimSuffix(rep.TaskID, "_entry")
-			
+
 			// 使用哈希映射直接定位规则
 			if i, exists := ruleIndex[rid]; exists {
 				rules[i].TotalTx += rep.TxDelta
@@ -1928,7 +2004,7 @@ func handleHealthReport(payload interface{}) {
 }
 
 func pushConfigToAll() {
-	mu.Lock()
+	mu.RLock() // 保护组装过程
 	tasksMap := make(map[string][]ForwardTask)
 	for _, r := range rules {
 		if r.Disabled {
@@ -1971,7 +2047,7 @@ func pushConfigToAll() {
 			activeAgents[k] = v
 		}
 	}
-	mu.Unlock()
+	mu.RUnlock()
 	for n, a := range activeAgents {
 		t := tasksMap[n]
 		if t == nil {
@@ -1998,7 +2074,7 @@ func handleServiceWorker(w http.ResponseWriter, r *http.Request) {
 func handleIcon(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/svg+xml")
 	w.Header().Set("Cache-Control", "public, max-age=31536000")
-	
+
 	svg := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 		<rect width="512" height="512" fill="#6366f1"/>
 		<text x="50%" y="50%" dominant-baseline="central" text-anchor="middle" fill="#ffffff" font-family="system-ui, sans-serif" font-size="130" font-weight="bold" letter-spacing="4">Relay</text>
@@ -2007,7 +2083,7 @@ func handleIcon(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDashboard(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
+	mu.RLock() // 已优化：读写锁
 	al := make([]AgentInfo, 0)
 	for _, a := range agents {
 		al = append(al, *a)
@@ -2038,7 +2114,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 			displayRules[i].EntryIP = "离线"
 		}
 	}
-	mu.Unlock()
+	mu.RUnlock()
 
 	sort.Slice(displayRules, func(i, j int) bool {
 		if displayRules[i].Group == displayRules[j].Group {
@@ -2047,18 +2123,13 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return displayRules[i].Group < displayRules[j].Group
 	})
 
+	// === 已优化：直接从内存缓存读取日志 ===
 	var displayLogs []OpLog
-	if db != nil {
-		rows, err := db.Query("SELECT time, ip, action, msg FROM logs ORDER BY id DESC LIMIT ?", MaxLogEntries)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var l OpLog
-				rows.Scan(&l.Time, &l.IP, &l.Action, &l.Msg)
-				displayLogs = append(displayLogs, l)
-			}
-		}
-	}
+	logMu.RLock()
+	displayLogs = make([]OpLog, len(recentLogs))
+	copy(displayLogs, recentLogs)
+	logMu.RUnlock()
+	// =====================================
 
 	// 提取近 30 天流量记录
 	var dailyStats []DailyStat
@@ -2083,9 +2154,9 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	dsBytes, _ := json.Marshal(dailyStats)
 
-	mu.Lock()
+	mu.RLock()
 	conf := config
-	mu.Unlock()
+	mu.RUnlock()
 
 	pStr := conf.AgentPorts
 	if pStr == "" {
@@ -2142,9 +2213,9 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
+		mu.RLock()
 		setup := config.IsSetup
-		mu.Unlock()
+		mu.RUnlock()
 		if !setup {
 			http.Redirect(w, r, "/setup", http.StatusSeeOther)
 			return
@@ -2154,9 +2225,9 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
-		mu.Lock()
+		mu.RLock()
 		exp, ok := sessions[c.Value]
-		mu.Unlock()
+		mu.RUnlock()
 		if !ok || time.Now().After(exp) {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
@@ -2166,9 +2237,9 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func handleSetup(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
+	mu.RLock()
 	alreadySetup := config.IsSetup
-	mu.Unlock()
+	mu.RUnlock()
 
 	if alreadySetup {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -2195,26 +2266,33 @@ func handleSetup(w http.ResponseWriter, r *http.Request) {
 	t.Execute(w, nil)
 }
 
-
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		mu.Lock()
+		mu.RLock()
 		isEnabled := config.TwoFAEnabled
 		githubEnabled := config.GithubClientID != "" && config.GithubClientSecret != ""
-		mu.Unlock()
-		
+		mu.RUnlock()
+
 		errCode := r.URL.Query().Get("err")
 		errMsg := ""
-		if errCode == "1" { errMsg = "账号或密码错误" }
-		if errCode == "2" { errMsg = "2FA 动态码错误" }
-		if errCode == "3" { errMsg = "GitHub 授权失败" }
-		if errCode == "4" { errMsg = "该 GitHub 账号不在允许列表中" }
+		if errCode == "1" {
+			errMsg = "账号或密码错误"
+		}
+		if errCode == "2" {
+			errMsg = "2FA 动态码错误"
+		}
+		if errCode == "3" {
+			errMsg = "GitHub 授权失败"
+		}
+		if errCode == "4" {
+			errMsg = "该 GitHub 账号不在允许列表中"
+		}
 
 		t, _ := template.New("l").Parse(loginHtml)
 		t.Execute(w, map[string]interface{}{
-			"TwoFA": isEnabled,
+			"TwoFA":         isEnabled,
 			"GithubEnabled": githubEnabled,
-			"Error": errMsg,
+			"Error":         errMsg,
 		})
 		return
 	}
@@ -2223,11 +2301,11 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "尝试次数过多", 429)
 		return
 	}
-	mu.Lock()
+	mu.RLock()
 	u, storedVal := config.WebUser, config.WebPass
 	twoFAEnabled := config.TwoFAEnabled
 	twoFASecret := config.TwoFASecret
-	mu.Unlock()
+	mu.RUnlock()
 
 	passMatch := false
 	parts := strings.Split(storedVal, "$")
@@ -2257,9 +2335,9 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	rand.Read(sid)
 	sidStr := hex.EncodeToString(sid)
 	mu.Lock()
-	sessions[sidStr] = time.Now().Add(365 * 24 * time.Hour) 
+	sessions[sidStr] = time.Now().Add(365 * 24 * time.Hour)
 	mu.Unlock()
-	
+
 	// 智能判断是否开启安全 Cookie
 	secureCookie := isMasterTLS || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{Name: "sid", Value: sidStr, Path: "/", HttpOnly: true, Secure: secureCookie, MaxAge: 31536000, SameSite: http.SameSiteLaxMode})
@@ -2274,9 +2352,9 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 // ================= GITHUB OAUTH =================
 
 func handleGithubLogin(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
+	mu.RLock()
 	clientID := config.GithubClientID
-	mu.Unlock()
+	mu.RUnlock()
 
 	if clientID == "" {
 		http.Error(w, "GitHub OAuth 未配置", http.StatusInternalServerError)
@@ -2294,16 +2372,16 @@ func handleGithubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
+	mu.RLock()
 	clientID := config.GithubClientID
 	clientSecret := config.GithubClientSecret
 	allowedUsersStr := config.GithubAllowedUsers
-	mu.Unlock()
+	mu.RUnlock()
 
 	tokenURL := fmt.Sprintf("https://github.com/login/oauth/access_token?client_id=%s&client_secret=%s&code=%s", clientID, clientSecret, code)
 	req, _ := http.NewRequest("POST", tokenURL, nil)
 	req.Header.Set("Accept", "application/json")
-	
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -2324,7 +2402,7 @@ func handleGithubCallback(w http.ResponseWriter, r *http.Request) {
 	userReq, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 	userReq.Header.Set("Authorization", "Bearer "+tokenData.AccessToken)
 	userReq.Header.Set("Accept", "application/json")
-	
+
 	userResp, err := client.Do(userReq)
 	if err != nil {
 		http.Redirect(w, r, "/login?err=3", http.StatusSeeOther)
@@ -2356,22 +2434,21 @@ func handleGithubCallback(w http.ResponseWriter, r *http.Request) {
 	sid := make([]byte, 16)
 	rand.Read(sid)
 	sidStr := hex.EncodeToString(sid)
-	
+
 	mu.Lock()
 	sessions[sidStr] = time.Now().Add(365 * 24 * time.Hour)
 	mu.Unlock()
-	
+
 	addLog(r, "系统登录", fmt.Sprintf("通过 GitHub 登录成功 (%s)", userData.Login))
 	secureCookie := isMasterTLS || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{Name: "sid", Value: sidStr, Path: "/", HttpOnly: true, Secure: secureCookie, MaxAge: 31536000, SameSite: http.SameSiteLaxMode})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-
 func handle2FAGenerate(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
+	mu.RLock()
 	u := config.WebUser
-	mu.Unlock()
+	mu.RUnlock()
 	key, _ := totp.Generate(totp.GenerateOpts{Issuer: "GoRelay-Pro", AccountName: u})
 	var buf bytes.Buffer
 	img, _ := qr.Encode(key.URL(), qr.M, qr.Auto)
@@ -2500,7 +2577,7 @@ func handleResetTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 	saveConfigNoLock()
 	mu.Unlock()
-	go pushConfigToAll() 
+	go pushConfigToAll()
 	http.Redirect(w, r, "/#rules", http.StatusSeeOther)
 }
 
@@ -2562,7 +2639,7 @@ func handleBatchRule(w http.ResponseWriter, r *http.Request) {
 	saveConfigNoLock()
 	mu.Unlock()
 
-	go pushConfigToAll() 
+	go pushConfigToAll()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
@@ -2601,21 +2678,23 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	config.GithubClientID = r.FormValue("github_client_id")
 	config.GithubClientSecret = r.FormValue("github_client_secret")
 	config.GithubAllowedUsers = r.FormValue("github_allowed_users")
-    config.R2AccessKey = r.FormValue("r2_access_key")
+	config.R2AccessKey = r.FormValue("r2_access_key")
 	config.R2SecretKey = r.FormValue("r2_secret_key")
 	config.R2Endpoint = r.FormValue("r2_endpoint")
 	config.R2Bucket = r.FormValue("r2_bucket")
-	
+
 	if rd := r.FormValue("traffic_reset_day"); rd != "" {
 		d, _ := strconv.Atoi(rd)
-		if d < 0 || d > 31 { d = 0 }
+		if d < 0 || d > 31 {
+			d = 0
+		}
 		config.TrafficResetDay = d
 	} else {
 		config.TrafficResetDay = 0
 	}
 
 	saveConfigNoLock()
-	
+
 	newPanelDomain := config.PanelDomain
 	newMasterDomain := config.MasterDomain
 	newPorts := config.AgentPorts
@@ -2679,7 +2758,7 @@ func handleUploadConfig(w http.ResponseWriter, r *http.Request) {
 
 	// 3. 重新初始化数据库连接
 	initDB()
-	
+
 	// 4. 解锁！必须在 loadConfig 之前解锁，避免内部循环锁死锁
 	mu.Unlock()
 
@@ -2687,9 +2766,9 @@ func handleUploadConfig(w http.ResponseWriter, r *http.Request) {
 	loadConfig()
 
 	// 获取恢复后的新面板域名
-	mu.Lock()
+	mu.RLock()
 	newPanelDomain := config.PanelDomain
-	mu.Unlock()
+	mu.RUnlock()
 
 	// 6. 响应前端成功，并下发新的重定向域名
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2726,7 +2805,13 @@ func handleClearLogs(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			// 重置自增 ID (SQLite 特定语法)
 			db.Exec("DELETE FROM sqlite_sequence WHERE name='logs'")
-			// 添加一条清空操作的记录
+			
+			// === 已优化：同步清空内存缓存 ===
+			logMu.Lock()
+			recentLogs = make([]OpLog, 0, MaxLogEntries)
+			logMu.Unlock()
+			// ==============================
+
 			addLog(r, "清理日志", "管理员手动清空了所有操作日志")
 		}
 	}
@@ -2734,8 +2819,8 @@ func handleClearLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleExportRules(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	mu.RLock()
+	defer mu.RUnlock()
 	b, err := json.MarshalIndent(rules, "", "  ")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2798,9 +2883,9 @@ func handleUpdateSystem(w http.ResponseWriter, r *http.Request) {
 
 func handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
-	mu.Lock()
+	mu.RLock()
 	agent, ok := agents[name]
-	mu.Unlock()
+	mu.RUnlock()
 	if !ok {
 		http.Error(w, "Agent not found", 404)
 		return
@@ -2813,8 +2898,8 @@ func handleUpdateAllAgents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		return
 	}
-	
-	mu.Lock()
+
+	mu.RLock()
 	count := 0
 	// 遍历所有节点，仅向在线节点发送更新指令
 	for _, agent := range agents {
@@ -2823,11 +2908,11 @@ func handleUpdateAllAgents(w http.ResponseWriter, r *http.Request) {
 			count++
 		}
 	}
-	mu.Unlock()
-	
+	mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true, 
+		"success": true,
 		"count":   count,
 	})
 }
@@ -2909,12 +2994,16 @@ func runAgent(name, masterAddr, token string) {
 	var publicIPv4, publicIPv6 string
 	client4 := http.Client{Timeout: 3 * time.Second}
 	if resp, err := client4.Get("http://ipv4.icanhazip.com"); err == nil {
-		if b, err := io.ReadAll(resp.Body); err == nil { publicIPv4 = strings.TrimSpace(string(b)) }
+		if b, err := io.ReadAll(resp.Body); err == nil {
+			publicIPv4 = strings.TrimSpace(string(b))
+		}
 		resp.Body.Close()
 	}
 	client6 := http.Client{Timeout: 3 * time.Second}
 	if resp, err := client6.Get("http://ipv6.icanhazip.com"); err == nil {
-		if b, err := io.ReadAll(resp.Body); err == nil { publicIPv6 = strings.TrimSpace(string(b)) }
+		if b, err := io.ReadAll(resp.Body); err == nil {
+			publicIPv6 = strings.TrimSpace(string(b))
+		}
 		resp.Body.Close()
 	}
 	// ------------------------------------
@@ -2948,7 +3037,9 @@ func runAgent(name, masterAddr, token string) {
 				defer ln.Close()
 				// 10 秒后自动关闭测试端口，防止端口泄露
 				ln.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Second))
-				if c, err := ln.Accept(); err == nil { c.Close() }
+				if c, err := ln.Accept(); err == nil {
+					c.Close()
+				}
 			}(testLn)
 		}
 		// -------------------------------------------------
@@ -3019,7 +3110,18 @@ func runAgent(name, masterAddr, token string) {
 				active := make(map[string]bool)
 				for _, t := range tasks {
 					active[t.ID] = true
-					activeTargets.Store(t.ID, t.Target)
+
+					// === 已优化：Zero-Allocation 目标预处理 ===
+					rawTargets := strings.Split(t.Target, ",")
+					var cleanTargets []string
+					for _, tg := range rawTargets {
+						tg = strings.TrimSpace(tg)
+						if tg != "" {
+							cleanTargets = append(cleanTargets, tg)
+						}
+					}
+					activeTargets.Store(t.ID, cleanTargets)
+					// ==========================================
 
 					if oldVal, loaded := activeTasks.LoadOrStore(t.ID, t); loaded {
 						oldTask := oldVal.(ForwardTask)
@@ -3082,69 +3184,89 @@ func doPing(address string) (int64, bool) {
 	return latency, true
 }
 
+// 已优化：并发化健康检查，消除定时器漂移
 func checkTargetHealth(conn net.Conn) {
 	var results []HealthReport
+	var muResults sync.Mutex
+	var wg sync.WaitGroup
+
 	activeTargets.Range(func(key, value interface{}) bool {
-		checkMode := "tcp"
-		if tVal, ok := activeTasks.Load(key); ok {
-			if t, ok := tVal.(ForwardTask); ok {
-				if t.Protocol == "udp" {
-					checkMode = "ping"
-				} else if t.Protocol == "both" {
-					checkMode = "mixed"
-				}
-			}
-		}
+		tid := key.(string)
+		targets := value.([]string) // 预处理后的切片
 
-		targets := strings.Split(value.(string), ",")
-		var bestLat int64 = -1
+		wg.Add(1)
+		go func(taskID string, tgList []string) {
+			defer wg.Done()
 
-		for _, target := range targets {
-			target = strings.TrimSpace(target)
-			if target == "" {
-				continue
-			}
-
-			var success bool
-			var lat int64
-
-			if checkMode == "ping" {
-				lat, success = doPing(target)
-			} else if checkMode == "mixed" {
-				start := time.Now()
-				c, err := net.DialTimeout("tcp", target, 2*time.Second)
-				if err == nil {
-					c.Close()
-					lat = time.Since(start).Milliseconds()
-					success = true
-				} else {
-					lat, success = doPing(target)
-				}
-			} else {
-				start := time.Now()
-				c, err := net.DialTimeout("tcp", target, 2*time.Second)
-				if err == nil {
-					c.Close()
-					lat = time.Since(start).Milliseconds()
-					success = true
-				} else {
-					success = false
+			checkMode := "tcp"
+			if tVal, ok := activeTasks.Load(taskID); ok {
+				if t, ok := tVal.(ForwardTask); ok {
+					if t.Protocol == "udp" {
+						checkMode = "ping"
+					} else if t.Protocol == "both" {
+						checkMode = "mixed"
+					}
 				}
 			}
 
-			if success {
-				if bestLat == -1 || lat < bestLat {
-					bestLat = lat
-				}
-				targetHealthMap.Store(target, lat)
-			} else {
-				targetHealthMap.Store(target, int64(-1))
-			}
-		}
+			var bestLat int64 = -1
+			var latMu sync.Mutex
+			var subWg sync.WaitGroup
 
-		results = append(results, HealthReport{TaskID: key.(string), Latency: bestLat})
+			for _, target := range tgList {
+				subWg.Add(1)
+				go func(tg string) {
+					defer subWg.Done()
+					var success bool
+					var lat int64
+
+					if checkMode == "ping" {
+						lat, success = doPing(tg)
+					} else if checkMode == "mixed" {
+						start := time.Now()
+						c, err := net.DialTimeout("tcp", tg, 2*time.Second)
+						if err == nil {
+							c.Close()
+							lat = time.Since(start).Milliseconds()
+							success = true
+						} else {
+							lat, success = doPing(tg)
+						}
+					} else {
+						start := time.Now()
+						c, err := net.DialTimeout("tcp", tg, 2*time.Second)
+						if err == nil {
+							c.Close()
+							lat = time.Since(start).Milliseconds()
+							success = true
+						} else {
+							success = false
+						}
+					}
+
+					if success {
+						latMu.Lock()
+						if bestLat == -1 || lat < bestLat {
+							bestLat = lat
+						}
+						latMu.Unlock()
+						targetHealthMap.Store(tg, lat)
+					} else {
+						targetHealthMap.Store(tg, int64(-1))
+					}
+				}(target)
+			}
+			subWg.Wait() // 等待该规则下所有目标检测完毕
+
+			muResults.Lock()
+			results = append(results, HealthReport{TaskID: taskID, Latency: bestLat})
+			muResults.Unlock()
+		}(tid, targets)
+
 		return true
 	})
+
+	wg.Wait() // 等待所有规则检测完毕
 
 	if len(results) > 0 {
 		_ = json.NewEncoder(conn).Encode(Message{Type: "health", Payload: results})
@@ -3252,10 +3374,18 @@ func startProxy(t ForwardTask) {
 			if err != nil {
 				return
 			}
+
+			// === 已优化：生命周期控制通道 ===
+			done := make(chan struct{})
 			l.Lock()
-			closers = append(closers, func() { ln.Close() })
+			closers = append(closers, func() {
+				ln.Close()
+				close(done)
+			})
 			l.Unlock()
-			handleUDP(ln, t.ID, ipTracker, t.SpeedLimit, t.LBStrategy)
+			// ==============================
+
+			handleUDP(ln, t.ID, ipTracker, t.SpeedLimit, t.LBStrategy, done)
 		}()
 	}
 }
@@ -3331,14 +3461,13 @@ func selectTarget(tid string, targets []string, strategy string) string {
 func pipeTCP(src net.Conn, tid string, limit int64, strategy string) {
 	defer src.Close()
 
-	var targetStr string
+	var allTargets []string
 	if v, ok := activeTargets.Load(tid); ok {
-		targetStr = v.(string)
+		allTargets = v.([]string) // 已优化：直接使用切片
 	} else {
 		return
 	}
 
-	allTargets := strings.Split(targetStr, ",")
 	bestTarget := selectTarget(tid, allTargets, strategy)
 
 	vConn, _ := connCounters.LoadOrStore(bestTarget, new(int64))
@@ -3357,26 +3486,33 @@ func pipeTCP(src net.Conn, tid string, limit int64, strategy string) {
 	copyCount(src, dst, &cnt.Rx, limit)
 }
 
-func handleUDP(ln *net.UDPConn, tid string, tracker *IpTracker, limit int64, strategy string) {
+func handleUDP(ln *net.UDPConn, tid string, tracker *IpTracker, limit int64, strategy string, done chan struct{}) {
 	udpSessions := &sync.Map{}
 	v, _ := agentTraffic.Load(tid)
 	cnt := v.(*TrafficCounter)
 
+	// === 已优化：加入生命周期管控，修复协程泄漏 ===
 	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
 		for {
-			time.Sleep(30 * time.Second)
-			now := time.Now()
-			udpSessions.Range(func(key, value interface{}) bool {
-				s := value.(*udpSession)
-				if now.Sub(s.lastActive) > 45*time.Second {
-					s.conn.Close()
-					udpSessions.Delete(key)
-					tracker.Remove(key.(string))
-				}
-				return true
-			})
+			select {
+			case <-done:
+				return // 收到外层 closeAll 的信号，优雅退出
+			case now := <-ticker.C:
+				udpSessions.Range(func(key, value interface{}) bool {
+					s := value.(*udpSession)
+					if now.Sub(s.lastActive) > 45*time.Second {
+						s.conn.Close()
+						udpSessions.Delete(key)
+						tracker.Remove(key.(string))
+					}
+					return true
+				})
+			}
 		}
 	}()
+	// ===========================================
 
 	bufPtr := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufPtr)
@@ -3395,13 +3531,12 @@ func handleUDP(ln *net.UDPConn, tid string, tracker *IpTracker, limit int64, str
 			s.conn.Write(buf[:n])
 		} else {
 
-			var currentTargetStr string
+			var targets []string
 			if v, ok := activeTargets.Load(tid); ok {
-				currentTargetStr = v.(string)
+				targets = v.([]string) // 已优化：直接使用切片
 			} else {
 				continue
 			}
-			targets := strings.Split(currentTargetStr, ",")
 
 			bestTarget := selectTarget(tid, targets, strategy)
 
@@ -3460,7 +3595,7 @@ func copyCount(dst io.Writer, src io.Reader, c *int64, limit int64) {
 			if limiter != nil {
 				_ = limiter.WaitN(ctx, nr)
 			}
-			
+
 			nw, _ := dst.Write(buf[0:nr])
 			if nw > 0 {
 				atomic.AddInt64(c, int64(nw))
@@ -3521,7 +3656,7 @@ func loadConfig() {
 				config.TrafficResetDay = d
 			case "last_reset_month":
 				config.LastResetMonth = v
-            case "r2_access_key":
+			case "r2_access_key":
 				config.R2AccessKey = v
 			case "r2_secret_key":
 				config.R2SecretKey = v
@@ -3591,7 +3726,7 @@ func saveConfigNoLock() {
 	setS("github_allowed_users", conf.GithubAllowedUsers)
 	setS("traffic_reset_day", strconv.Itoa(conf.TrafficResetDay))
 	setS("last_reset_month", conf.LastResetMonth)
-    setS("r2_access_key", conf.R2AccessKey)
+	setS("r2_access_key", conf.R2AccessKey)
 	setS("r2_secret_key", conf.R2SecretKey)
 	setS("r2_endpoint", conf.R2Endpoint)
 	setS("r2_bucket", conf.R2Bucket)
@@ -3599,10 +3734,18 @@ func saveConfigNoLock() {
 	_, _ = tx.Exec("DELETE FROM rules")
 	for _, r := range lRules {
 		d, a80, a95, a100 := 0, 0, 0, 0
-		if r.Disabled { d = 1 }
-		if r.Alert80 { a80 = 1 }
-		if r.Alert95 { a95 = 1 }
-		if r.Alert100 { a100 = 1 }
+		if r.Disabled {
+			d = 1
+		}
+		if r.Alert80 {
+			a80 = 1
+		}
+		if r.Alert95 {
+			a95 = 1
+		}
+		if r.Alert100 {
+			a100 = 1
+		}
 
 		_, _ = tx.Exec(`INSERT INTO rules (id, group_name, note, entry_agent, entry_port, exit_agent, target_ip, target_port, protocol, bridge_port, traffic_limit, disabled, speed_limit, total_tx, total_rx, lb_strategy, alert_80, alert_95, alert_100) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			r.ID, r.Group, r.Note, r.EntryAgent, r.EntryPort, r.ExitAgent, r.TargetIP, r.TargetPort, r.Protocol, r.BridgePort, r.TrafficLimit, d, r.SpeedLimit, r.TotalTx, r.TotalRx, r.LBStrategy, a80, a95, a100)
