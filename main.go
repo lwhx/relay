@@ -6484,46 +6484,57 @@ input:focus, select:focus {
     Chart.defaults.font.family = "'Inter', sans-serif";
     Chart.defaults.color = '#94a3b8';
     
+    // --- 1. 实时流量图 (加深极光渐变，隐藏网格) ---
     var ctx = document.getElementById('trafficChart').getContext('2d');
     var txGrad = ctx.createLinearGradient(0, 0, 0, 300);
-    txGrad.addColorStop(0, 'rgba(16, 185, 129, 0.25)'); txGrad.addColorStop(1, 'rgba(16, 185, 129, 0)');
+    txGrad.addColorStop(0, 'rgba(16, 185, 129, 0.45)'); // 加深渐变，增强玻璃质感
+    txGrad.addColorStop(1, 'rgba(16, 185, 129, 0)');
     
     var rxGrad = ctx.createLinearGradient(0, 0, 0, 300);
-    rxGrad.addColorStop(0, 'rgba(6, 182, 212, 0.25)'); rxGrad.addColorStop(1, 'rgba(6, 182, 212, 0)');
+    rxGrad.addColorStop(0, 'rgba(6, 182, 212, 0.45)'); 
+    rxGrad.addColorStop(1, 'rgba(6, 182, 212, 0)');
 
     var chart = new Chart(ctx, {
         type: 'line',
-        data: { labels: Array(30).fill(''), datasets: [ { label: 'Tx', data: Array(30).fill(0), borderColor: '#10b981', backgroundColor: txGrad, borderWidth: 2.5, pointRadius: 0, fill: true, tension: 0.4 }, { label: 'Rx', data: Array(30).fill(0), borderColor: '#06b6d4', backgroundColor: rxGrad, borderWidth: 2.5, pointRadius: 0, fill: true, tension: 0.4 } ] },
-        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(3, 7, 18, 0.95)', titleColor: '#f9fafb', bodyColor: '#d1d5db', borderColor: 'rgba(16, 185, 129, 0.2)', borderWidth: 1, padding: 12, displayColors: true, cornerRadius: 10, callbacks: { label: function(context) { return context.dataset.label + ': ' + context.raw + ' MB/s'; } } } }, scales: { x: { display: false }, y: { beginAtZero: true, grid: { color: 'rgba(128, 128, 128, 0.06)', borderDash: [4, 4] }, ticks: { callback: v => v + ' MB/s', font: {size: 10}, maxTicksLimit: 5 } } }, interaction: { mode: 'nearest', axis: 'x', intersect: false } }
-    });
-
-    var ctxPie = document.getElementById('pieChart').getContext('2d');
-    var pieChart = new Chart(ctxPie, {
-        type: 'doughnut',
-        data: { labels: [], datasets: [{ data: [], backgroundColor: ['#10b981', '#06b6d4', '#f59e0b', '#8b5cf6', '#3b82f6'], borderWidth: 0, hoverOffset: 6 }] },
+        data: { labels: Array(30).fill(''), datasets: [ { label: 'Tx', data: Array(30).fill(0), borderColor: '#10b981', backgroundColor: txGrad, borderWidth: 3, pointRadius: 0, fill: true, tension: 0.4 }, { label: 'Rx', data: Array(30).fill(0), borderColor: '#06b6d4', backgroundColor: rxGrad, borderWidth: 3, pointRadius: 0, fill: true, tension: 0.4 } ] },
         options: { 
-            responsive: true, 
-            maintainAspectRatio: false, 
+            responsive: true, maintainAspectRatio: false, 
             plugins: { 
-                legend: { position: 'bottom', labels: { boxWidth: 10, usePointStyle: true, padding: 20, font: {size: 11} } },
-                tooltip: { callbacks: { label: function(context) { return context.label + ': ' + context.raw + ' GB'; } } }
+                legend: { display: false }, 
+                tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(15, 23, 42, 0.85)', titleColor: '#f9fafb', bodyColor: '#d1d5db', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1, padding: 12, displayColors: true, cornerRadius: 10, callbacks: { label: function(context) { return context.dataset.label + ': ' + context.raw + ' MB/s'; } } } 
             }, 
-            cutout: '72%' 
+            scales: { 
+                x: { display: false }, 
+                y: { beginAtZero: true, border: { display: false }, grid: { display: false }, ticks: { callback: v => v + ' MB/s', font: {size: 10}, maxTicksLimit: 5 } } 
+            }, 
+            interaction: { mode: 'nearest', axis: 'x', intersect: false } 
         }
     });
 
-    // 初始化近 30 天流量柱状图
+    // --- 2. 流量分布饼图 (调整中空比例与悬浮动画) ---
+    var ctxPie = document.getElementById('pieChart').getContext('2d');
+    var pieChart = new Chart(ctxPie, {
+        type: 'doughnut',
+        data: { labels: [], datasets: [{ data: [], backgroundColor: ['#10b981', '#06b6d4', '#f59e0b', '#8b5cf6', '#3b82f6'], borderWidth: 0, hoverOffset: 8 }] },
+        options: { 
+            responsive: true, maintainAspectRatio: false, 
+            plugins: { 
+                legend: { position: 'bottom', labels: { boxWidth: 10, usePointStyle: true, padding: 20, font: {size: 11} } },
+                tooltip: { backgroundColor: 'rgba(15, 23, 42, 0.85)', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1, padding: 12, cornerRadius: 10, callbacks: { label: function(context) { return context.label + ': ' + context.raw + ' GB'; } } }
+            }, 
+            cutout: '78%' // 更细的环形，看起来更高级
+        }
+    });
+
+    // --- 3. 近 30 天流量图 (保留你的切换逻辑，彻底隐藏网格) ---
     var dailyStatsData = {{.DailyStatsJSON}};
     var ctxDaily = document.getElementById('dailyChart').getContext('2d');
-    
-    // 从 localStorage 读取用户的图表偏好，默认为柱状图
     var dailyChartType = localStorage.getItem('dailyChartType') || 'bar';
     
-    // 生成渐变色彩（用于曲线图的底部填充）
     var txGradDaily = ctxDaily.createLinearGradient(0, 0, 0, 250);
-    txGradDaily.addColorStop(0, 'rgba(16, 185, 129, 0.3)'); txGradDaily.addColorStop(1, 'rgba(16, 185, 129, 0)');
+    txGradDaily.addColorStop(0, 'rgba(16, 185, 129, 0.4)'); txGradDaily.addColorStop(1, 'rgba(16, 185, 129, 0)');
     var rxGradDaily = ctxDaily.createLinearGradient(0, 0, 0, 250);
-    rxGradDaily.addColorStop(0, 'rgba(6, 182, 212, 0.3)'); rxGradDaily.addColorStop(1, 'rgba(6, 182, 212, 0)');
+    rxGradDaily.addColorStop(0, 'rgba(6, 182, 212, 0.4)'); rxGradDaily.addColorStop(1, 'rgba(6, 182, 212, 0)');
 
     var dailyChart = new Chart(ctxDaily, {
         type: dailyChartType,
@@ -6538,39 +6549,33 @@ input:focus, select:focus {
             responsive: true, maintainAspectRatio: false,
             plugins: { 
                 legend: { display: true, position: 'top', labels: {color: '#94a3b8', font: {size: 11, weight: 500}, usePointStyle: true, boxWidth: 10, padding: 20} }, 
-                tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(3, 7, 18, 0.95)', titleColor: '#f9fafb', bodyColor: '#d1d5db', borderColor: 'rgba(16, 185, 129, 0.2)', borderWidth: 1, padding: 12, cornerRadius: 10,
-                    callbacks: { label: function(c) { return c.dataset.label + ': ' + formatBytes(c.raw); } } 
-                } 
+                tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(15, 23, 42, 0.85)', titleColor: '#f9fafb', bodyColor: '#d1d5db', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1, padding: 12, cornerRadius: 10, callbacks: { label: function(c) { return c.dataset.label + ': ' + formatBytes(c.raw); } } } 
             },
             scales: { 
-                x: { stacked: true, grid: {display: false}, ticks: {color: '#94a3b8', font: {size: 10}} }, 
-                y: { stacked: true, grid: { color: 'rgba(128, 128, 128, 0.06)', borderDash: [4, 4] }, ticks: { color: '#94a3b8', callback: v => formatBytes(v), maxTicksLimit: 6, font: {size: 10} } } 
+                x: { stacked: true, border: { display: false }, grid: {display: false}, ticks: {color: '#94a3b8', font: {size: 10}} }, 
+                y: { stacked: true, border: { display: false }, grid: { display: false }, ticks: { color: '#94a3b8', callback: v => formatBytes(v), maxTicksLimit: 6, font: {size: 10} } } 
             },
             interaction: { mode: 'index', axis: 'x', intersect: false }
         }
     });
 
-    // 动态应用图表样式和属性
     function applyDailyChartState() {
         if (dailyChartType === 'line') {
-            // 曲线图专属美化
             dailyChart.data.datasets[0].borderColor = '#10b981';
             dailyChart.data.datasets[0].backgroundColor = txGradDaily;
-            dailyChart.data.datasets[0].borderWidth = 2;
+            dailyChart.data.datasets[0].borderWidth = 3;
             dailyChart.data.datasets[0].fill = true;
             dailyChart.data.datasets[0].tension = 0.4;
             
             dailyChart.data.datasets[1].borderColor = '#06b6d4';
             dailyChart.data.datasets[1].backgroundColor = rxGradDaily;
-            dailyChart.data.datasets[1].borderWidth = 2;
+            dailyChart.data.datasets[1].borderWidth = 3;
             dailyChart.data.datasets[1].fill = true;
             dailyChart.data.datasets[1].tension = 0.4;
             
-            // 取消坐标轴堆叠，保证曲线图时重合部分的趋势能清晰辨认
             dailyChart.options.scales.x.stacked = false;
             dailyChart.options.scales.y.stacked = false;
         } else {
-            // 柱状图专属美化
             dailyChart.data.datasets[0].backgroundColor = '#10b981';
             dailyChart.data.datasets[0].borderWidth = 0;
             dailyChart.data.datasets[0].fill = false;
@@ -6579,35 +6584,32 @@ input:focus, select:focus {
             dailyChart.data.datasets[1].borderWidth = 0;
             dailyChart.data.datasets[1].fill = false;
 
-            // 恢复柱状图的堆叠模式
             dailyChart.options.scales.x.stacked = true;
             dailyChart.options.scales.y.stacked = true;
         }
         
-        // 更新 UI 图标：当前为圆柱则按钮提示切换到曲线，反之亦然
         const toggleIcon = document.getElementById('dailyChartToggleIcon');
         const titleIcon = document.getElementById('dailyChartTitleIcon');
         if (toggleIcon) toggleIcon.className = dailyChartType === 'bar' ? 'ri-line-chart-line' : 'ri-bar-chart-grouped-line';
         if (titleIcon) titleIcon.className = dailyChartType === 'bar' ? 'ri-bar-chart-grouped-line' : 'ri-line-chart-line';
-        
         dailyChart.update();
     }
     
-    // 用户触发图表切换事件
     function toggleDailyChart() {
         dailyChartType = dailyChartType === 'bar' ? 'line' : 'bar';
         localStorage.setItem('dailyChartType', dailyChartType);
         dailyChart.config.type = dailyChartType;
         applyDailyChartState();
     }
-    
-    // 初始化图表最终状态
     applyDailyChartState();
 
     function updateChartTheme(theme) {
-        const gridColor = theme === 'dark' ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.05)';
-        chart.options.scales.y.grid.color = gridColor; chart.update();
-        if(dailyChart) { dailyChart.options.scales.y.grid.color = gridColor; dailyChart.update(); }
+        // 网格线已移除，只需切换文字颜色
+        const textColor = theme === 'dark' ? '#94a3b8' : '#64748b';
+        Chart.defaults.color = textColor;
+        chart.update();
+        if(dailyChart) dailyChart.update();
+        if(pieChart) pieChart.update();
     }
 
     function formatBytes(b) {
