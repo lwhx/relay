@@ -2,11 +2,11 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -33,22 +33,22 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+    "context" 
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/boombuler/barcode"
 	"github.com/boombuler/barcode/qr"
 	"github.com/gorilla/websocket"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/acme/autocert"
-	"golang.org/x/time/rate"
 	_ "modernc.org/sqlite"
 )
 
 // --- 配置与常量 ---
 
 const (
-	AppVersion      = "v3.3.0"
+	AppVersion      = "v3.3.1"
 	DBFile          = "data.db"
 	WebPort         = ":8888"
 	DownloadURL     = "https://jht126.eu.org/https://github.com/jinhuaitao/relay/releases/latest/download/relay"
@@ -92,11 +92,11 @@ type LogicalRule struct {
 	TargetStatus  bool  `json:"-"`
 	TargetLatency int64 `json:"-"`
 
-	Alert80       bool   `json:"alert_80"`
-	Alert95       bool   `json:"alert_95"`
-	Alert100      bool   `json:"alert_100"`
-	BridgeLatency int64  `json:"-"`
-	EntryIP       string `json:"-"`
+	Alert80  bool `json:"alert_80"`
+	Alert95  bool `json:"alert_95"`
+	Alert100 bool `json:"alert_100"`
+	BridgeLatency int64 `json:"-"`
+	EntryIP string `json:"-"`
 }
 
 type OpLog struct {
@@ -131,7 +131,7 @@ type AppConfig struct {
 	GithubAllowedUsers string            `json:"github_allowed_users"`
 	TrafficResetDay    int               `json:"traffic_reset_day"`
 	LastResetMonth     string            `json:"last_reset_month"`
-	R2AccessKey        string            `json:"r2_access_key"`
+    R2AccessKey        string            `json:"r2_access_key"`
 	R2SecretKey        string            `json:"r2_secret_key"`
 	R2Endpoint         string            `json:"r2_endpoint"`
 	R2Bucket           string            `json:"r2_bucket"`
@@ -161,14 +161,14 @@ type HealthReport struct {
 }
 
 type AgentInfo struct {
-	Name        string    `json:"name"`
-	RemoteIP    string    `json:"remote_ip"`
-	Conn        net.Conn  `json:"-"`
-	SysStatus   string    `json:"sys_status"`
+	Name      string   `json:"name"`
+	RemoteIP  string   `json:"remote_ip"`
+	Conn      net.Conn `json:"-"`
+	SysStatus string   `json:"sys_status"`
 	ConnectedAt time.Time `json:"-"`
-	Version     string    `json:"version"`
-	Region      string    `json:"region"`
-	IsOnline    bool      `json:"is_online"`
+    Version     string    `json:"version"`
+    Region      string    `json:"region"`
+    IsOnline    bool      `json:"is_online"`
 }
 
 type Message struct {
@@ -203,27 +203,21 @@ type WSDashboardData struct {
 type AgentStatusData struct {
 	Name      string `json:"name"`
 	SysStatus string `json:"sys_status"`
-	IsOnline  bool   `json:"is_online"`
+    IsOnline  bool   `json:"is_online"`
 }
 
 type RuleStatusData struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Group         string `json:"group"`
-	Total         int64  `json:"total"`
-	Tx            int64  `json:"tx"`
-	Rx            int64  `json:"rx"`
-	UserCount     int64  `json:"uc"`
-	Limit         int64  `json:"limit"`
-	Status        bool   `json:"status"`
-	Latency       int64  `json:"latency"`
-	BridgeLatency int64  `json:"bridge_latency"`
-}
-
-// 优化：UDP 零分配 Map Key 结构体
-type udpClientKey struct {
-	IP   [16]byte
-	Port int
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+    Group     string `json:"group"`
+	Total     int64  `json:"total"`
+	Tx        int64  `json:"tx"`
+	Rx        int64  `json:"rx"`
+	UserCount int64  `json:"uc"`
+	Limit     int64  `json:"limit"`
+	Status    bool   `json:"status"`
+	Latency   int64  `json:"latency"`
+	BridgeLatency int64 `json:"bridge_latency"`
 }
 
 var (
@@ -231,7 +225,7 @@ var (
 	config           AppConfig
 	agents           = make(map[string]*AgentInfo)
 	rules            = make([]LogicalRule, 0)
-	mu               sync.RWMutex // 已优化：读写锁分离
+	mu               sync.Mutex
 	runningListeners sync.Map
 	activeTasks      sync.Map
 	activeTargets    sync.Map
@@ -258,12 +252,9 @@ var (
 	lastCPUIdle  uint64
 	lastCPUTotal uint64
 
+	// 每日流量统计缓冲（提升数据库性能）
 	dailyTxBuf int64
 	dailyRxBuf int64
-
-	// 已优化：日志内存级缓存
-	recentLogs []OpLog
-	logMu      sync.RWMutex
 )
 
 // --- 数据库初始化与优化 ---
@@ -490,7 +481,7 @@ func getSysStatus() string {
 					for i := 1; i < len(fields) && i <= 8; i++ {
 						ticks[i-1], _ = strconv.ParseUint(fields[i], 10, 64)
 					}
-					idleTicks := ticks[3] + ticks[4]
+					idleTicks := ticks[3] + ticks[4] 
 					var totalTicks uint64
 					for _, t := range ticks {
 						totalTicks += t
@@ -516,21 +507,11 @@ func getSysStatus() string {
 				fields := strings.Fields(line)
 				if len(fields) >= 2 {
 					val, _ := strconv.ParseUint(fields[1], 10, 64)
-					if fields[0] == "MemTotal:" {
-						total = val
-					}
-					if fields[0] == "MemAvailable:" {
-						available = val
-					}
-					if fields[0] == "MemFree:" {
-						free = val
-					}
-					if fields[0] == "Buffers:" {
-						buffers = val
-					}
-					if fields[0] == "Cached:" {
-						cached = val
-					}
+					if fields[0] == "MemTotal:" { total = val }
+					if fields[0] == "MemAvailable:" { available = val }
+					if fields[0] == "MemFree:" { free = val }
+					if fields[0] == "Buffers:" { buffers = val }
+					if fields[0] == "Cached:" { cached = val }
 				}
 			}
 			if total > 0 {
@@ -546,7 +527,7 @@ func getSysStatus() string {
 		var stat syscall.Statfs_t
 		if err := syscall.Statfs("/", &stat); err == nil {
 			used := stat.Blocks - stat.Bfree
-			nonRootTotal := used + stat.Bavail
+			nonRootTotal := used + stat.Bavail 
 			if nonRootTotal > 0 {
 				diskPct = (float64(used) / float64(nonRootTotal)) * 100.0
 			}
@@ -554,25 +535,13 @@ func getSysStatus() string {
 	} else {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
-		memPct = 1.0
-		cpuPct = float64(runtime.NumGoroutine())
+		memPct = 1.0 
+		cpuPct = float64(runtime.NumGoroutine()) 
 	}
 
-	if cpuPct < 0 {
-		cpuPct = 0
-	} else if cpuPct > 100 {
-		cpuPct = 100
-	}
-	if memPct < 0 {
-		memPct = 0
-	} else if memPct > 100 {
-		memPct = 100
-	}
-	if diskPct < 0 {
-		diskPct = 0
-	} else if diskPct > 100 {
-		diskPct = 100
-	}
+	if cpuPct < 0 { cpuPct = 0 } else if cpuPct > 100 { cpuPct = 100 }
+	if memPct < 0 { memPct = 0 } else if memPct > 100 { memPct = 100 }
+	if diskPct < 0 { diskPct = 0 } else if diskPct > 100 { diskPct = 100 }
 
 	return fmt.Sprintf("CPU:%.1f|MEM:%.1f|DSK:%.1f", cpuPct, memPct, diskPct)
 }
@@ -592,20 +561,12 @@ func getClientIP(r *http.Request) string {
 	return ip
 }
 
-// 已优化：日志操作直接写入内存与 DB
 func addLog(r *http.Request, action, msg string) {
 	ip := getClientIP(r)
 	now := time.Now().Format("01-02 15:04:05")
 	if db != nil {
 		_, _ = db.Exec("INSERT INTO logs (time, ip, action, msg) VALUES (?,?,?,?)", now, ip, action, msg)
 	}
-
-	logMu.Lock()
-	recentLogs = append([]OpLog{{Time: now, IP: ip, Action: action, Msg: msg}}, recentLogs...)
-	if len(recentLogs) > MaxLogEntries {
-		recentLogs = recentLogs[:MaxLogEntries]
-	}
-	logMu.Unlock()
 }
 
 func addSystemLog(ip, action, msg string) {
@@ -613,13 +574,6 @@ func addSystemLog(ip, action, msg string) {
 	if db != nil {
 		_, _ = db.Exec("INSERT INTO logs (time, ip, action, msg) VALUES (?,?,?,?)", now, ip, action, msg)
 	}
-
-	logMu.Lock()
-	recentLogs = append([]OpLog{{Time: now, IP: ip, Action: action, Msg: msg}}, recentLogs...)
-	if len(recentLogs) > MaxLogEntries {
-		recentLogs = recentLogs[:MaxLogEntries]
-	}
-	logMu.Unlock()
 }
 
 func handleService(op, mode, name, connect, token string, useTLS bool) {
@@ -719,9 +673,9 @@ func doSelfUninstall() {
 // ================= TG BOT INTERACTIVE =================
 
 func tgRequest(method string, payload interface{}) {
-	mu.RLock()
+	mu.Lock()
 	token := config.TgBotToken
-	mu.RUnlock()
+	mu.Unlock()
 	if token == "" {
 		return
 	}
@@ -737,9 +691,9 @@ func tgRequest(method string, payload interface{}) {
 }
 
 func sendTelegram(text string) {
-	mu.RLock()
+	mu.Lock()
 	chatID := config.TgChatID
-	mu.RUnlock()
+	mu.Unlock()
 	if chatID == "" {
 		return
 	}
@@ -750,7 +704,9 @@ func sendTelegram(text string) {
 	})
 }
 
-// 终极美学进度条
+// --- TG 交互增强工具 ---
+
+// 终极美学进度条：支持传入自定义的 UI 设计字符
 func makeAestheticBar(percent float64, fillChar, emptyChar string) string {
 	if percent < 0 {
 		percent = 0
@@ -758,22 +714,30 @@ func makeAestheticBar(percent float64, fillChar, emptyChar string) string {
 	if percent > 100 {
 		percent = 100
 	}
-	totalWidth := 12
+	
+	totalWidth := 12 // 12格是极简符号的视觉黄金比例
+	
 	filledBlocks := int((percent / 100.0) * float64(totalWidth))
+	
+	// 保证只要有占用，就至少亮起一格，避免 1% 显示为空
 	if percent > 0 && filledBlocks == 0 {
-		filledBlocks = 1
+		filledBlocks = 1 
 	}
 	if filledBlocks > totalWidth {
 		filledBlocks = totalWidth
 	}
+	
 	emptyBlocks := totalWidth - filledBlocks
+	
 	return strings.Repeat(fillChar, filledBlocks) + strings.Repeat(emptyChar, emptyBlocks)
 }
 
+
+// 向 Telegram 自动注册原生快捷菜单 (Menu Button)
 func setupTgBotCommands() {
-	mu.RLock()
+	mu.Lock()
 	token := config.TgBotToken
-	mu.RUnlock()
+	mu.Unlock()
 	if token == "" {
 		return
 	}
@@ -795,11 +759,12 @@ func setupTgBotCommands() {
 	}()
 }
 
+// --- TG 云备份功能核心 ---
 func sendTelegramDocument(filePath string, caption string) {
-	mu.RLock()
+	mu.Lock()
 	token := config.TgBotToken
 	chatID := config.TgChatID
-	mu.RUnlock()
+	mu.Unlock()
 	if token == "" || chatID == "" {
 		return
 	}
@@ -836,21 +801,24 @@ func sendTelegramDocument(filePath string, caption string) {
 }
 
 func uploadToR2(filePath string) error {
-	mu.RLock()
+	mu.Lock()
 	ak := config.R2AccessKey
 	sk := config.R2SecretKey
 	endpoint := config.R2Endpoint
 	bucket := config.R2Bucket
-	mu.RUnlock()
+	mu.Unlock()
 
+	// 如果没有配置，就不执行备份
 	if ak == "" || sk == "" || endpoint == "" || bucket == "" {
 		return fmt.Errorf("R2 配置未启用")
 	}
 
+	// 强制 SQLite 刷盘，保证上传的是最完整的数据快照
 	if db != nil {
 		db.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
 	}
 
+	// MinIO SDK 要求 Endpoint 不带协议头
 	endpoint = strings.TrimPrefix(endpoint, "https://")
 	endpoint = strings.TrimPrefix(endpoint, "http://")
 
@@ -862,7 +830,9 @@ func uploadToR2(filePath string) error {
 		return err
 	}
 
+	// 文件名带上时间戳：gorelay_backup_20260412_120000.db
 	fileName := fmt.Sprintf("gorelay_backup_%s.db", time.Now().Format("20060102_150405"))
+	
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -878,10 +848,10 @@ func autoBackupLoop() {
 		time.Sleep(1 * time.Hour)
 		now := time.Now()
 
-		mu.RLock()
+		mu.Lock()
 		token := config.TgBotToken
 		chatID := config.TgChatID
-		mu.RUnlock()
+		mu.Unlock()
 
 		if token == "" || chatID == "" {
 			continue
@@ -892,7 +862,8 @@ func autoBackupLoop() {
 		if now.Weekday() == time.Monday && now.Hour() == 2 && lastBackupWeek != week {
 			lastBackupWeek = week
 			sendTelegramDocument(DBFile, fmt.Sprintf("☁️ <b>自动云备份</b>\n\n这是本周的系统数据备份。\n时间: %s", now.Format("2006-01-02 15:04:05")))
-
+			
+			// === 触发 R2 备份 ===
 			if err := uploadToR2(DBFile); err == nil {
 				sendTelegram("✅ <b>R2 容灾备份成功</b>\n数据库已安全同步至 Cloudflare R2。")
 			} else if err.Error() != "R2 配置未启用" {
@@ -926,10 +897,10 @@ func sendTgMenu(chatID string) {
 
 func buildRulesMenuMarkup(page int) map[string]interface{} {
 	var rows [][]InlineButton
-	mu.RLock()
-	defer mu.RUnlock()
+	mu.Lock()
+	defer mu.Unlock()
 
-	pageSize := 10
+	pageSize := 10 // 每页显示的规则数量
 	totalRules := len(rules)
 	totalPages := (totalRules + pageSize - 1) / pageSize
 	if totalPages == 0 {
@@ -948,6 +919,7 @@ func buildRulesMenuMarkup(page int) map[string]interface{} {
 		end = totalRules
 	}
 
+	// 渲染当前页的规则按钮
 	for i := start; i < end; i++ {
 		r := rules[i]
 		status := "🟢"
@@ -958,9 +930,11 @@ func buildRulesMenuMarkup(page int) map[string]interface{} {
 		if r.Group != "" {
 			text += fmt.Sprintf(" (%s)", r.Group)
 		}
+		// 回调数据中带上当前页码，以便操作后能停留在本页
 		rows = append(rows, []InlineButton{{Text: text, CallbackData: fmt.Sprintf("toggle:%s:%d", r.ID, page)}})
 	}
 
+	// 渲染分页导航行
 	var navRow []InlineButton
 	if page > 1 {
 		navRow = append(navRow, InlineButton{Text: "⬅️ 上一页", CallbackData: fmt.Sprintf("page:%d", page-1)})
@@ -970,6 +944,8 @@ func buildRulesMenuMarkup(page int) map[string]interface{} {
 		navRow = append(navRow, InlineButton{Text: "下一页 ➡️", CallbackData: fmt.Sprintf("page:%d", page+1)})
 	}
 	rows = append(rows, navRow)
+
+	// 底部返回按钮
 	rows = append(rows, []InlineButton{{Text: "🔙 返回主菜单", CallbackData: "cmd:menu"}})
 	return map[string]interface{}{"inline_keyboard": rows}
 }
@@ -977,10 +953,10 @@ func buildRulesMenuMarkup(page int) map[string]interface{} {
 func startTgBotLoop() {
 	var offset int64 = 0
 	for {
-		mu.RLock()
+		mu.Lock()
 		token := config.TgBotToken
 		allowedChat := config.TgChatID
-		mu.RUnlock()
+		mu.Unlock()
 
 		if token == "" || allowedChat == "" {
 			time.Sleep(10 * time.Second)
@@ -1026,6 +1002,8 @@ func startTgBotLoop() {
 
 		for _, update := range res.Result {
 			offset = update.UpdateID + 1
+
+			// 处理直接输入的指令
 			if update.Message != nil {
 				chatIdStr := fmt.Sprintf("%d", update.Message.Chat.ID)
 				if chatIdStr != allowedChat {
@@ -1035,6 +1013,7 @@ func startTgBotLoop() {
 				if text == "/start" || text == "/menu" || text == "/help" {
 					sendTgMenu(chatIdStr)
 				} else if text == "/status" {
+					// 模拟触发状态按钮
 					update.CallbackQuery = &struct {
 						ID      string `json:"id"`
 						Data    string `json:"data"`
@@ -1053,6 +1032,7 @@ func startTgBotLoop() {
 						ID int64 `json:"id"`
 					}{ID: update.Message.Chat.ID}}}
 				} else if text == "/rules" {
+					// 模拟触发规则按钮
 					update.CallbackQuery = &struct {
 						ID      string `json:"id"`
 						Data    string `json:"data"`
@@ -1073,14 +1053,17 @@ func startTgBotLoop() {
 				}
 			}
 
+			// 处理内联键盘回调
 			if update.CallbackQuery != nil {
 				chatIdStr := fmt.Sprintf("%d", update.CallbackQuery.Message.Chat.ID)
 				if chatIdStr != allowedChat {
 					continue
 				}
+
 				if update.CallbackQuery.ID != "" {
 					tgRequest("answerCallbackQuery", map[string]interface{}{"callback_query_id": update.CallbackQuery.ID})
 				}
+
 				data := update.CallbackQuery.Data
 				msgID := update.CallbackQuery.Message.MessageID
 
@@ -1096,9 +1079,7 @@ func startTgBotLoop() {
 						},
 					}
 					tgAction := "editMessageText"
-					if msgID == 0 {
-						tgAction = "sendMessage"
-					}
+					if msgID == 0 { tgAction = "sendMessage" }
 					tgRequest(tgAction, map[string]interface{}{
 						"chat_id":      chatIdStr,
 						"message_id":   msgID,
@@ -1107,14 +1088,15 @@ func startTgBotLoop() {
 						"reply_markup": markup,
 					})
 				} else if data == "cmd:status" {
-					mu.RLock()
+					mu.Lock()
 					var tx, rx int64
 					for _, r := range rules {
 						tx += r.TotalTx
 						rx += r.TotalRx
 					}
 					reply := fmt.Sprintf("📊 <b>系统实时状态</b>\n\n🌐 总中继流量: <b>%s</b>\n🔌 在线节点数: <b>%d</b>\n📜 转发规则数: <b>%d</b>\n\n--- 探针状态 ---\n", formatBytes(tx+rx), len(agents), len(rules))
-
+					
+					// === 新增 TG 节点排序逻辑 ===
 					var sortedAgents []*AgentInfo
 					for _, a := range agents {
 						sortedAgents = append(sortedAgents, a)
@@ -1128,26 +1110,24 @@ func startTgBotLoop() {
 						return t1 < t2
 					})
 
+					// 将原来的 for _, a := range agents 改为遍历 sortedAgents
 					for _, a := range sortedAgents {
+						// === 新增：如果是离线节点，直接显示离线状态并跳过资源渲染 ===
 						if !a.IsOnline {
 							reply += fmt.Sprintf("💻 <b>%s</b> <code>[%s]</code> (🔴 离线)\n\n", a.Name, a.RemoteIP)
 							continue
 						}
+						// =======================================================
+
 						var cpu, mem, dsk float64
 						parts := strings.Split(a.SysStatus, "|")
 						for _, p := range parts {
 							kv := strings.Split(p, ":")
 							if len(kv) == 2 {
 								v, _ := strconv.ParseFloat(kv[1], 64)
-								if kv[0] == "CPU" {
-									cpu = v
-								}
-								if kv[0] == "MEM" {
-									mem = v
-								}
-								if kv[0] == "DSK" {
-									dsk = v
-								}
+								if kv[0] == "CPU" { cpu = v }
+								if kv[0] == "MEM" { mem = v }
+								if kv[0] == "DSK" { dsk = v }
 							}
 						}
 						reply += fmt.Sprintf("💻 <b>%s</b> <code>[%s]</code> (🟢 在线)\n", a.Name, a.RemoteIP)
@@ -1158,48 +1138,49 @@ func startTgBotLoop() {
 					if len(agents) == 0 {
 						reply += "⚠️ <i>暂无节点在线</i>\n\n"
 					}
-					mu.RUnlock()
+					mu.Unlock()
 
+					// 查询近 30 天流量消耗趋势
 					reply += "--- 历史流量趋势 ---\n"
+					
 					var total30Tx, total30Rx int64
 					var historyLines []string
 					if db != nil {
 						dsRows, err := db.Query("SELECT date, tx, rx FROM daily_stats ORDER BY date DESC LIMIT 30")
 						if err == nil {
 							defer dsRows.Close()
+							
 							for dsRows.Next() {
 								var d string
 								var dTx, dRx int64
 								dsRows.Scan(&d, &dTx, &dRx)
 								total30Tx += dTx
 								total30Rx += dRx
+								
 								if len(historyLines) < 10 {
 									shortDate := d
-									if len(d) == 10 {
-										shortDate = d[5:]
-									}
+									if len(d) == 10 { shortDate = d[5:] }
 									historyLines = append(historyLines, fmt.Sprintf("📅 %s ⬆️%s ⬇️%s", shortDate, formatBytes(dTx), formatBytes(dRx)))
 								}
 							}
 						}
 					}
+					
 					if len(historyLines) > 0 {
 						reply += fmt.Sprintf("🗓️ <b>近 30 天总计: %s</b>\n", formatBytes(total30Tx+total30Rx))
-						for _, line := range historyLines {
-							reply += line + "\n"
-						}
+						for _, line := range historyLines { reply += line + "\n" }
 					} else {
 						reply += "<i>暂无历史流量数据</i>\n"
 					}
+					
 					nowTime := time.Now().Format("2006-01-02 15:04:05")
 					reply += fmt.Sprintf("\n<blockquote expandable>🕒 探针最后同步时间: \n<code>%s</code></blockquote>", nowTime)
+
 					markup := map[string]interface{}{
 						"inline_keyboard": [][]InlineButton{{{Text: "🔙 返回主菜单", CallbackData: "cmd:menu"}, {Text: "🔄 刷新状态", CallbackData: "cmd:status"}}},
 					}
 					tgAction := "editMessageText"
-					if msgID == 0 {
-						tgAction = "sendMessage"
-					}
+					if msgID == 0 { tgAction = "sendMessage" }
 					tgRequest(tgAction, map[string]interface{}{
 						"chat_id":      chatIdStr,
 						"message_id":   msgID,
@@ -1216,9 +1197,7 @@ func startTgBotLoop() {
 						}
 					}
 					tgAction := "editMessageText"
-					if msgID == 0 {
-						tgAction = "sendMessage"
-					}
+					if msgID == 0 { tgAction = "sendMessage" }
 					tgRequest(tgAction, map[string]interface{}{
 						"chat_id":      chatIdStr,
 						"message_id":   msgID,
@@ -1228,7 +1207,10 @@ func startTgBotLoop() {
 					})
 				} else if data == "cmd:backup" {
 					go func() {
+						// 1. 先发送到 Telegram
 						sendTelegramDocument(DBFile, fmt.Sprintf("☁️ <b>手动云备份</b>\n\n数据库文件已成功导出。\n时间: %s", time.Now().Format("2006-01-02 15:04:05")))
+						
+						// 2. 触发 Cloudflare R2 备份
 						if err := uploadToR2(DBFile); err == nil {
 							sendTelegram("✅ <b>R2 容灾备份成功</b>\n手动触发的备份已同步至 Cloudflare R2。")
 						} else if err.Error() != "R2 配置未启用" {
@@ -1236,6 +1218,7 @@ func startTgBotLoop() {
 						}
 					}()
 				} else if strings.HasPrefix(data, "toggle:") {
+					// 格式: toggle:id:page
 					parts := strings.Split(data, ":")
 					if len(parts) >= 2 {
 						id := parts[1]
@@ -1244,6 +1227,7 @@ func startTgBotLoop() {
 							p, _ := strconv.Atoi(parts[2])
 							page = p
 						}
+						
 						mu.Lock()
 						for i := range rules {
 							if rules[i].ID == id {
@@ -1254,6 +1238,7 @@ func startTgBotLoop() {
 						saveConfigNoLock()
 						mu.Unlock()
 						go pushConfigToAll()
+
 						tgRequest("editMessageText", map[string]interface{}{
 							"chat_id":      chatIdStr,
 							"message_id":   msgID,
@@ -1263,6 +1248,7 @@ func startTgBotLoop() {
 						})
 					}
 				} else if data == "cmd:restart" {
+					// 增加二级确认防护
 					markup := map[string]interface{}{
 						"inline_keyboard": [][]InlineButton{
 							{{Text: "⚠️ 确认重启", CallbackData: "action:confirm_restart"}},
@@ -1297,15 +1283,19 @@ func startTgBotLoop() {
 func trafficResetLoop() {
 	for {
 		time.Sleep(1 * time.Hour)
-		mu.RLock()
+		
+		mu.Lock()
 		day := config.TrafficResetDay
 		lastM := config.LastResetMonth
-		mu.RUnlock()
+		mu.Unlock()
+
 		if day <= 0 || day > 31 {
 			continue
 		}
+
 		now := time.Now()
 		currentM := now.Format("2006-01")
+		
 		if now.Day() >= day && lastM != currentM {
 			mu.Lock()
 			for i := range rules {
@@ -1318,11 +1308,15 @@ func trafficResetLoop() {
 			config.LastResetMonth = currentM
 			saveConfigNoLock()
 			mu.Unlock()
+			
 			sendTelegram(fmt.Sprintf("📅 <b>账单日触发</b>\n系统已自动清零本月所有规则的流量统计！"))
 			go pushConfigToAll()
 		}
 	}
 }
+
+
+// ================= MASTER =================
 
 // ================= TG DAILY REPORT =================
 
@@ -1331,15 +1325,19 @@ func dailyTrafficReportLoop() {
 	for {
 		time.Sleep(1 * time.Minute)
 		now := time.Now()
+
 		if now.Hour() == 23 && now.Minute() >= 59 {
 			today := now.Format("2006-01-02")
 			if lastReportDate == today {
 				continue
 			}
+
 			flushDailyStats()
+
 			if db == nil {
 				continue
 			}
+
 			var tx, rx int64
 			err := db.QueryRow("SELECT tx, rx FROM daily_stats WHERE date = ?", today).Scan(&tx, &rx)
 			if err == nil && (tx > 0 || rx > 0) {
@@ -1355,26 +1353,6 @@ func dailyTrafficReportLoop() {
 // ================= MASTER =================
 
 func runMaster() {
-	initDB()
-	loadConfig()
-
-	// === 已优化：启动时预加载日志到内存 ===
-	if db != nil {
-		rows, err := db.Query("SELECT time, ip, action, msg FROM logs ORDER BY id DESC LIMIT ?", MaxLogEntries)
-		if err == nil {
-			logMu.Lock()
-			recentLogs = make([]OpLog, 0, MaxLogEntries)
-			for rows.Next() {
-				var l OpLog
-				rows.Scan(&l.Time, &l.IP, &l.Action, &l.Msg)
-				recentLogs = append(recentLogs, l)
-			}
-			logMu.Unlock()
-			rows.Close()
-		}
-	}
-	// ===================================
-
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		for range ticker.C {
@@ -1389,19 +1367,19 @@ func runMaster() {
 		}
 	}()
 	go broadcastLoop()
-	go startTgBotLoop()
-	go autoBackupLoop()
+	go startTgBotLoop()   
+	go autoBackupLoop()   
 	go trafficResetLoop()
 	go dailyTrafficReportLoop()
 
-	mu.RLock()
+	mu.Lock()
 	panelDomain := config.PanelDomain
 	nodeDomain := config.MasterDomain
 	portsStr := config.AgentPorts
 	if portsStr == "" {
 		portsStr = "9999"
 	}
-	mu.RUnlock()
+	mu.Unlock()
 
 	var tlsConfig *tls.Config
 	isMasterTLS = false
@@ -1460,7 +1438,7 @@ func runMaster() {
 				log.Printf("❌ 监听端口 %s 失败: %v", p, err)
 				return
 			}
-
+			
 			if isMasterTLS {
 				log.Printf("✅ Agent 监听端口启动 (安全 TLS 模式): %s", p)
 			} else {
@@ -1501,22 +1479,21 @@ func runMaster() {
 	http.HandleFunc("/restart", authMiddleware(handleRestart))
 	http.HandleFunc("/update_sys", authMiddleware(handleUpdateSystem))
 	http.HandleFunc("/update_agent", authMiddleware(handleUpdateAgent))
-	http.HandleFunc("/update_all_agents", authMiddleware(handleUpdateAllAgents))
 	http.HandleFunc("/check_update", authMiddleware(handleCheckUpdate))
 	http.HandleFunc("/gen_agent_token", authMiddleware(handleGenAgentToken))
-
+	
 	http.HandleFunc("/oauth/github/login", handleGithubLogin)
 	http.HandleFunc("/oauth/github/callback", handleGithubCallback)
-
+	
 	http.HandleFunc("/manifest.json", handleManifest)
 	http.HandleFunc("/sw.js", handleServiceWorker)
 	http.HandleFunc("/icon.svg", handleIcon)
 
 	webHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.RLock()
+		mu.Lock()
 		pDomain := config.PanelDomain
 		nDomain := config.MasterDomain
-		mu.RUnlock()
+		mu.Unlock()
 
 		if pDomain != "" && nDomain != "" && pDomain != nDomain {
 			host := r.Host
@@ -1542,7 +1519,7 @@ func runMaster() {
 			TLSConfig: tlsConfig,
 			Handler:   webHandler,
 		}
-		log.Fatal(server.ListenAndServeTLS("", ""))
+		log.Fatal(server.ListenAndServeTLS("", "")) 
 	} else {
 		log.Printf("🚀 控制面板启动 (普通 HTTP): http://localhost%s", WebPort)
 		server := &http.Server{
@@ -1553,6 +1530,7 @@ func runMaster() {
 	}
 }
 
+// 每日流量统计定期刷盘
 func flushDailyStats() {
 	if db == nil {
 		return
@@ -1590,10 +1568,11 @@ func handleGenAgentToken(w http.ResponseWriter, r *http.Request) {
 	if !exists {
 		tk = generateUUID()
 		config.AgentTokens[name] = tk
-		config.AgentAddTimes[name] = time.Now().Unix()
+		config.AgentAddTimes[name] = time.Now().Unix() // 记录永久添加时间
 		saveConfigNoLock()
 	}
 	mu.Unlock()
+
 	w.Write([]byte(tk))
 }
 
@@ -1622,7 +1601,7 @@ func broadcastLoop() {
 	var lastTotalRx int64 = 0
 
 	for range ticker.C {
-		mu.RLock() // 已优化：读写锁
+		mu.Lock()
 		var currentTx, currentRx int64
 		var agentData []AgentStatusData
 		var ruleData []RuleStatusData
@@ -1642,37 +1621,38 @@ func broadcastLoop() {
 		for _, a := range agentList {
 			agentData = append(agentData, AgentStatusData{Name: a.Name, SysStatus: a.SysStatus, IsOnline: a.IsOnline})
 		}
-
+		
 		for _, r := range rules {
 			currentTx += r.TotalTx
 			currentRx += r.TotalRx
 			ruleData = append(ruleData, RuleStatusData{
-				ID:            r.ID,
-				Name:          r.Note,
-				Group:         r.Group,
-				Total:         r.TotalTx + r.TotalRx,
-				Tx:            r.TotalTx,
-				Rx:            r.TotalRx,
-				UserCount:     r.UserCount,
-				Limit:         r.TrafficLimit,
-				Status:        r.TargetStatus,
-				Latency:       r.TargetLatency,
+				ID:        r.ID,
+				Name:      r.Note,
+                Group:     r.Group,
+				Total:     r.TotalTx + r.TotalRx,
+				Tx:        r.TotalTx,
+				Rx:        r.TotalRx,
+				UserCount: r.UserCount,
+				Limit:     r.TrafficLimit,
+				Status:    r.TargetStatus,
+				Latency:   r.TargetLatency,
 				BridgeLatency: r.BridgeLatency,
 			})
 		}
-		mu.RUnlock()
+		mu.Unlock()
 
-		// === 已优化：直接从内存缓存读取最新的日志，脱离 DB ===
 		var logData []OpLog
-		logMu.RLock()
-		limit := 15
-		if len(recentLogs) < 15 {
-			limit = len(recentLogs)
+		if db != nil {
+			lRows, err := db.Query("SELECT time, ip, action, msg FROM logs ORDER BY id DESC LIMIT 15")
+			if err == nil {
+				for lRows.Next() {
+					var l OpLog
+					lRows.Scan(&l.Time, &l.IP, &l.Action, &l.Msg)
+					logData = append(logData, l)
+				}
+				lRows.Close()
+			}
 		}
-		logData = make([]OpLog, limit)
-		copy(logData, recentLogs[:limit])
-		logMu.RUnlock()
-		// ====================================================
 
 		var speedTx int64 = 0
 		var speedRx int64 = 0
@@ -1694,7 +1674,6 @@ func broadcastLoop() {
 			wsMu.Unlock()
 			continue
 		}
-
 		msg := WSMessage{
 			Type: "stats",
 			Data: WSDashboardData{
@@ -1706,30 +1685,13 @@ func broadcastLoop() {
 				Logs:         logData,
 			},
 		}
-
-		msgBytes, err := json.Marshal(msg)
-		if err != nil {
-			wsMu.Unlock()
-			continue
-		}
-
-		// === 终极优化：解除 WebSocket 广播的锁竞争 ===
-		activeWs := make([]*websocket.Conn, 0, len(wsClients))
 		for client := range wsClients {
-			activeWs = append(activeWs, client)
-		}
-		wsMu.Unlock() // 极速释放锁，防止网络差的客户端阻塞系统
-
-		// 锁外发送，无惧慢客户端
-		for _, client := range activeWs {
-			if err := client.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
-				wsMu.Lock()
-				delete(wsClients, client)
-				wsMu.Unlock()
+			if err := client.WriteJSON(msg); err != nil {
 				client.Close()
+				delete(wsClients, client)
 			}
 		}
-		// =============================================
+		wsMu.Unlock()
 	}
 }
 
@@ -1747,22 +1709,24 @@ func handleAgentConn(conn net.Conn) {
 	}
 	reqToken, _ := data["token"].(string)
 	name, _ := data["name"].(string)
+	// --- 新增：获取节点汇报的 IP 和 测试端口 ---
 	reportedIPv4, _ := data["ipv4"].(string)
 	reportedIPv6, _ := data["ipv6"].(string)
 	testPortFloat, _ := data["test_port"].(float64)
 	testPort := int(testPortFloat)
-	reportedVersion, _ := data["version"].(string)
+    reportedVersion, _ := data["version"].(string)
 	if reportedVersion == "" {
 		reportedVersion = "未知"
 	}
+	// --------------------------------------
 
-	mu.RLock()
+	mu.Lock()
 	globalTk := config.AgentToken
 	var agentTk string
 	if config.AgentTokens != nil {
 		agentTk = config.AgentTokens[name]
 	}
-	mu.RUnlock()
+	mu.Unlock()
 
 	if reqToken == "" || name == "" {
 		return
@@ -1770,20 +1734,24 @@ func handleAgentConn(conn net.Conn) {
 	if (globalTk != "" && reqToken == globalTk) || (agentTk != "" && reqToken == agentTk) {
 		// 认证通过
 	} else {
-		return
+		return // 认证失败
 	}
 
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	
+	// --- 新增：智能入站连通性测试 (优先全功能 IPv4，备用全功能 IPv6) ---
 	finalIP := remoteIP
 	if testPort > 0 {
 		ipv4Ok := false
 		if reportedIPv4 != "" {
+			// 主控尝试连接节点的 IPv4
 			if c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", reportedIPv4, testPort), 2*time.Second); err == nil {
 				c.Close()
 				ipv4Ok = true
 				finalIP = reportedIPv4
 			}
 		}
+		// 如果 IPv4 连不通 (说明是出栈/NAT)，再去试 IPv6
 		if !ipv4Ok && reportedIPv6 != "" {
 			if c, err := net.DialTimeout("tcp", fmt.Sprintf("[%s]:%d", reportedIPv6, testPort), 2*time.Second); err == nil {
 				c.Close()
@@ -1792,14 +1760,17 @@ func handleAgentConn(conn net.Conn) {
 		}
 	}
 	remoteIP = finalIP
+	// ----------------------------------------------------------
 
 	mu.Lock()
 	if old, exists := agents[name]; exists {
 		old.Conn.Close()
 	}
+	// 初始化为获取中
 	agents[name] = &AgentInfo{Name: name, RemoteIP: remoteIP, Conn: conn, ConnectedAt: time.Now(), IsOnline: true, Version: reportedVersion, Region: "🌍 --"}
 	mu.Unlock()
 
+	// --- 新增：异步获取 IP 地理位置，并转换为 Emoji 国旗 ---
 	go func(ipStr, agentName string) {
 		host := ipStr
 		if h, _, err := net.SplitHostPort(ipStr); err == nil {
@@ -1807,13 +1778,13 @@ func handleAgentConn(conn net.Conn) {
 		}
 		host = strings.Trim(host, "[]")
 		client := http.Client{Timeout: 3 * time.Second}
+		// 使用免费接口查询 IP 信息
 		if resp, err := client.Get("http://ip-api.com/json/" + host + "?fields=countryCode"); err == nil {
 			defer resp.Body.Close()
-			var res struct {
-				CountryCode string `json:"countryCode"`
-			}
+			var res struct{ CountryCode string `json:"countryCode"` }
 			if json.NewDecoder(resp.Body).Decode(&res) == nil && len(res.CountryCode) == 2 {
 				cc := strings.ToUpper(res.CountryCode)
+				// 巧妙利用 Unicode 偏移量将两位字母转为国旗 Emoji (例如 US 会变成 🇺🇸)
 				flag := string([]rune{rune(cc[0]) + 127397, rune(cc[1]) + 127397}) + " " + cc
 				mu.Lock()
 				if a, ok := agents[agentName]; ok {
@@ -1851,9 +1822,10 @@ func handleAgentConn(conn net.Conn) {
 	}
 	mu.Lock()
 	if curr, ok := agents[name]; ok && curr.Conn == conn {
-		curr.IsOnline = false
+		curr.IsOnline = false  // <--- 修改这里：不删除，仅标记离线
 		mu.Unlock()
 		sendTelegram(fmt.Sprintf("🔴 节点下线通知\n名称: %s", name))
+		// === 新增：将节点下线事件写入系统日志 ===
 		addSystemLog(remoteIP, "Agent 下线", fmt.Sprintf("节点 %s 已断开连接", name))
 	} else {
 		mu.Unlock()
@@ -1868,38 +1840,39 @@ func handleStatsReport(payload interface{}) {
 	mu.Lock()
 	defer mu.Unlock()
 	limitTriggered := false
-	ruleIndex := make(map[string]int, len(rules))
-	for i := range rules {
-		ruleIndex[rules[i].ID] = i
-	}
-
 	for _, rep := range reports {
 		if strings.HasSuffix(rep.TaskID, "_entry") {
 			rid := strings.TrimSuffix(rep.TaskID, "_entry")
-			if i, exists := ruleIndex[rid]; exists {
-				rules[i].TotalTx += rep.TxDelta
-				rules[i].TotalRx += rep.RxDelta
-				rules[i].UserCount = rep.UserCount
-				atomic.StoreInt32(&configDirty, 1)
+			for i := range rules {
+				if rules[i].ID == rid {
+					rules[i].TotalTx += rep.TxDelta
+					rules[i].TotalRx += rep.RxDelta
+					rules[i].UserCount = rep.UserCount
+					atomic.StoreInt32(&configDirty, 1)
 
-				atomic.AddInt64(&dailyTxBuf, rep.TxDelta)
-				atomic.AddInt64(&dailyRxBuf, rep.RxDelta)
+					// 将增量数据记录到每日流量统计缓冲池中
+					atomic.AddInt64(&dailyTxBuf, rep.TxDelta)
+					atomic.AddInt64(&dailyRxBuf, rep.RxDelta)
 
-				limit := rules[i].TrafficLimit
-				total := rules[i].TotalTx + rules[i].TotalRx
-				if limit > 0 {
-					pct := float64(total) / float64(limit)
-					if pct >= 1.0 && !rules[i].Alert100 {
-						rules[i].Alert100 = true
-						sendTelegram(fmt.Sprintf("🚨 <b>流量耗尽熔断</b>\n\n规则：【%s】\n状态：已切断连接\n说明：流量达到 100%%，该端口已自动熔断！", rules[i].Note))
-						limitTriggered = true
-					} else if pct >= 0.95 && pct < 1.0 && !rules[i].Alert95 {
-						rules[i].Alert95 = true
-						sendTelegram(fmt.Sprintf("⚠️ <b>流量极高预警</b>\n\n规则：【%s】\n状态：即将熔断\n说明：流量已使用超过 95%%！", rules[i].Note))
-					} else if pct >= 0.80 && pct < 0.95 && !rules[i].Alert80 {
-						rules[i].Alert80 = true
-						sendTelegram(fmt.Sprintf("🔔 <b>流量使用预警</b>\n\n规则：【%s】\n状态：运行中\n说明：流量已使用超过 80%%。", rules[i].Note))
+					// --- 智能预警机制开始 ---
+					limit := rules[i].TrafficLimit
+					total := rules[i].TotalTx + rules[i].TotalRx
+					if limit > 0 {
+						pct := float64(total) / float64(limit)
+						if pct >= 1.0 && !rules[i].Alert100 {
+							rules[i].Alert100 = true
+							sendTelegram(fmt.Sprintf("🚨 <b>流量耗尽熔断</b>\n\n规则：【%s】\n状态：已切断连接\n说明：流量达到 100%%，为了您的钱包安全，该端口已自动熔断！", rules[i].Note))
+							limitTriggered = true
+						} else if pct >= 0.95 && pct < 1.0 && !rules[i].Alert95 {
+							rules[i].Alert95 = true
+							sendTelegram(fmt.Sprintf("⚠️ <b>流量极高预警</b>\n\n规则：【%s】\n状态：即将熔断\n说明：流量已使用超过 95%%，请及时检查或重置流量！", rules[i].Note))
+						} else if pct >= 0.80 && pct < 0.95 && !rules[i].Alert80 {
+							rules[i].Alert80 = true
+							sendTelegram(fmt.Sprintf("🔔 <b>流量使用预警</b>\n\n规则：【%s】\n状态：运行中\n说明：流量已使用超过 80%%。", rules[i].Note))
+						}
 					}
+					// --- 智能预警机制结束 ---
+					break
 				}
 			}
 		}
@@ -1925,7 +1898,7 @@ func handleHealthReport(payload interface{}) {
 					break
 				}
 			}
-		} else if strings.HasSuffix(rep.TaskID, "_entry") {
+		} else if strings.HasSuffix(rep.TaskID, "_entry") { // --- 新增：截获入口到出口的延迟 ---
 			rid := strings.TrimSuffix(rep.TaskID, "_entry")
 			for i := range rules {
 				if rules[i].ID == rid {
@@ -1938,7 +1911,7 @@ func handleHealthReport(payload interface{}) {
 }
 
 func pushConfigToAll() {
-	mu.RLock()
+	mu.Lock()
 	tasksMap := make(map[string][]ForwardTask)
 	for _, r := range rules {
 		if r.Disabled {
@@ -1981,7 +1954,7 @@ func pushConfigToAll() {
 			activeAgents[k] = v
 		}
 	}
-	mu.RUnlock()
+	mu.Unlock()
 	for n, a := range activeAgents {
 		t := tasksMap[n]
 		if t == nil {
@@ -2008,12 +1981,16 @@ func handleServiceWorker(w http.ResponseWriter, r *http.Request) {
 func handleIcon(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/svg+xml")
 	w.Header().Set("Cache-Control", "public, max-age=31536000")
-	svg := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" fill="#6366f1"/><text x="50%" y="50%" dominant-baseline="central" text-anchor="middle" fill="#ffffff" font-family="system-ui, sans-serif" font-size="130" font-weight="bold" letter-spacing="4">Relay</text></svg>`
+	
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+		<rect width="512" height="512" fill="#6366f1"/>
+		<text x="50%" y="50%" dominant-baseline="central" text-anchor="middle" fill="#ffffff" font-family="system-ui, sans-serif" font-size="130" font-weight="bold" letter-spacing="4">Relay</text>
+	</svg>`
 	w.Write([]byte(svg))
 }
 
 func handleDashboard(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
+	mu.Lock()
 	al := make([]AgentInfo, 0)
 	for _, a := range agents {
 		al = append(al, *a)
@@ -2022,7 +1999,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		t1 := config.AgentAddTimes[al[i].Name]
 		t2 := config.AgentAddTimes[al[j].Name]
 		if t1 == t2 {
-			return al[i].Name < al[j].Name
+			return al[i].Name < al[j].Name // 时间相同的老节点按名称字母排序
 		}
 		return t1 < t2
 	})
@@ -2033,17 +2010,18 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	displayRules := make([]LogicalRule, len(rules))
 	for i, r := range rules {
 		displayRules[i] = r
+		// 根据节点名称查找当前真实的入口 IP
 		if a, ok := agents[r.EntryAgent]; ok {
 			rip := a.RemoteIP
 			if strings.Contains(rip, ":") && !strings.Contains(rip, "[") {
-				rip = "[" + rip + "]"
+				rip = "[" + rip + "]" // 处理 IPv6
 			}
 			displayRules[i].EntryIP = rip
 		} else {
 			displayRules[i].EntryIP = "离线"
 		}
 	}
-	mu.RUnlock()
+	mu.Unlock()
 
 	sort.Slice(displayRules, func(i, j int) bool {
 		if displayRules[i].Group == displayRules[j].Group {
@@ -2053,11 +2031,19 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	})
 
 	var displayLogs []OpLog
-	logMu.RLock()
-	displayLogs = make([]OpLog, len(recentLogs))
-	copy(displayLogs, recentLogs)
-	logMu.RUnlock()
+	if db != nil {
+		rows, err := db.Query("SELECT time, ip, action, msg FROM logs ORDER BY id DESC LIMIT ?", MaxLogEntries)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var l OpLog
+				rows.Scan(&l.Time, &l.IP, &l.Action, &l.Msg)
+				displayLogs = append(displayLogs, l)
+			}
+		}
+	}
 
+	// 提取近 30 天流量记录
 	var dailyStats []DailyStat
 	if db != nil {
 		dsRows, err := db.Query("SELECT date, tx, rx FROM daily_stats ORDER BY date DESC LIMIT 30")
@@ -2070,17 +2056,19 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// 将数据按时间顺序颠倒，方便图表显示
 	for i, j := 0, len(dailyStats)-1; i < j; i, j = i+1, j-1 {
 		dailyStats[i], dailyStats[j] = dailyStats[j], dailyStats[i]
 	}
+	// 如果没有任何记录，给一条今天的空数据防止前台报错
 	if len(dailyStats) == 0 {
 		dailyStats = append(dailyStats, DailyStat{Date: time.Now().Format("2006-01-02"), Tx: 0, Rx: 0})
 	}
 	dsBytes, _ := json.Marshal(dailyStats)
 
-	mu.RLock()
+	mu.Lock()
 	conf := config
-	mu.RUnlock()
+	mu.Unlock()
 
 	pStr := conf.AgentPorts
 	if pStr == "" {
@@ -2137,9 +2125,9 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		mu.RLock()
+		mu.Lock()
 		setup := config.IsSetup
-		mu.RUnlock()
+		mu.Unlock()
 		if !setup {
 			http.Redirect(w, r, "/setup", http.StatusSeeOther)
 			return
@@ -2149,9 +2137,9 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
-		mu.RLock()
+		mu.Lock()
 		exp, ok := sessions[c.Value]
-		mu.RUnlock()
+		mu.Unlock()
 		if !ok || time.Now().After(exp) {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
@@ -2161,13 +2149,15 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func handleSetup(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
+	mu.Lock()
 	alreadySetup := config.IsSetup
-	mu.RUnlock()
+	mu.Unlock()
+
 	if alreadySetup {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
+
 	if r.Method == "POST" {
 		mu.Lock()
 		config.WebUser = r.FormValue("username")
@@ -2188,29 +2178,27 @@ func handleSetup(w http.ResponseWriter, r *http.Request) {
 	t.Execute(w, nil)
 }
 
+
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		mu.RLock()
+		mu.Lock()
 		isEnabled := config.TwoFAEnabled
 		githubEnabled := config.GithubClientID != "" && config.GithubClientSecret != ""
-		mu.RUnlock()
-
+		mu.Unlock()
+		
 		errCode := r.URL.Query().Get("err")
 		errMsg := ""
-		if errCode == "1" {
-			errMsg = "账号或密码错误"
-		}
-		if errCode == "2" {
-			errMsg = "2FA 动态码错误"
-		}
-		if errCode == "3" {
-			errMsg = "GitHub 授权失败"
-		}
-		if errCode == "4" {
-			errMsg = "该 GitHub 账号不在允许列表中"
-		}
+		if errCode == "1" { errMsg = "账号或密码错误" }
+		if errCode == "2" { errMsg = "2FA 动态码错误" }
+		if errCode == "3" { errMsg = "GitHub 授权失败" }
+		if errCode == "4" { errMsg = "该 GitHub 账号不在允许列表中" }
+
 		t, _ := template.New("l").Parse(loginHtml)
-		t.Execute(w, map[string]interface{}{"TwoFA": isEnabled, "GithubEnabled": githubEnabled, "Error": errMsg})
+		t.Execute(w, map[string]interface{}{
+			"TwoFA": isEnabled,
+			"GithubEnabled": githubEnabled,
+			"Error": errMsg,
+		})
 		return
 	}
 	ip := getClientIP(r)
@@ -2218,11 +2206,11 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "尝试次数过多", 429)
 		return
 	}
-	mu.RLock()
+	mu.Lock()
 	u, storedVal := config.WebUser, config.WebPass
 	twoFAEnabled := config.TwoFAEnabled
 	twoFASecret := config.TwoFASecret
-	mu.RUnlock()
+	mu.Unlock()
 
 	passMatch := false
 	parts := strings.Split(storedVal, "$")
@@ -2233,11 +2221,13 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	} else if r.FormValue("username") == u && md5Hash(r.FormValue("password")) == storedVal {
 		passMatch = true
 	}
+
 	if !passMatch {
 		recordLoginFail(ip)
 		http.Redirect(w, r, "/login?err=1", http.StatusSeeOther)
 		return
 	}
+
 	if twoFAEnabled {
 		if !totp.Validate(r.FormValue("code"), twoFASecret) {
 			recordLoginFail(ip)
@@ -2245,12 +2235,15 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
 	sid := make([]byte, 16)
 	rand.Read(sid)
 	sidStr := hex.EncodeToString(sid)
 	mu.Lock()
-	sessions[sidStr] = time.Now().Add(365 * 24 * time.Hour)
+	sessions[sidStr] = time.Now().Add(365 * 24 * time.Hour) 
 	mu.Unlock()
+	
+	// 智能判断是否开启安全 Cookie
 	secureCookie := isMasterTLS || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{Name: "sid", Value: sidStr, Path: "/", HttpOnly: true, Secure: secureCookie, MaxAge: 31536000, SameSite: http.SameSiteLaxMode})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -2261,14 +2254,18 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
+// ================= GITHUB OAUTH =================
+
 func handleGithubLogin(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
+	mu.Lock()
 	clientID := config.GithubClientID
-	mu.RUnlock()
+	mu.Unlock()
+
 	if clientID == "" {
 		http.Error(w, "GitHub OAuth 未配置", http.StatusInternalServerError)
 		return
 	}
+
 	redirectURL := fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s", clientID)
 	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 }
@@ -2279,14 +2276,17 @@ func handleGithubCallback(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login?err=3", http.StatusSeeOther)
 		return
 	}
-	mu.RLock()
+
+	mu.Lock()
 	clientID := config.GithubClientID
 	clientSecret := config.GithubClientSecret
 	allowedUsersStr := config.GithubAllowedUsers
-	mu.RUnlock()
+	mu.Unlock()
+
 	tokenURL := fmt.Sprintf("https://github.com/login/oauth/access_token?client_id=%s&client_secret=%s&code=%s", clientID, clientSecret, code)
 	req, _ := http.NewRequest("POST", tokenURL, nil)
 	req.Header.Set("Accept", "application/json")
+	
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -2294,6 +2294,7 @@ func handleGithubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
 	var tokenData struct {
 		AccessToken string `json:"access_token"`
 	}
@@ -2302,19 +2303,23 @@ func handleGithubCallback(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login?err=3", http.StatusSeeOther)
 		return
 	}
+
 	userReq, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 	userReq.Header.Set("Authorization", "Bearer "+tokenData.AccessToken)
 	userReq.Header.Set("Accept", "application/json")
+	
 	userResp, err := client.Do(userReq)
 	if err != nil {
 		http.Redirect(w, r, "/login?err=3", http.StatusSeeOther)
 		return
 	}
 	defer userResp.Body.Close()
+
 	var userData struct {
 		Login string `json:"login"`
 	}
 	json.NewDecoder(userResp.Body).Decode(&userData)
+
 	allowedUsers := strings.Split(allowedUsersStr, ",")
 	isAllowed := false
 	for _, u := range allowedUsers {
@@ -2323,28 +2328,33 @@ func handleGithubCallback(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+
 	if !isAllowed || userData.Login == "" {
 		ip := getClientIP(r)
 		recordLoginFail(ip)
 		http.Redirect(w, r, "/login?err=4", http.StatusSeeOther)
 		return
 	}
+
 	sid := make([]byte, 16)
 	rand.Read(sid)
 	sidStr := hex.EncodeToString(sid)
+	
 	mu.Lock()
 	sessions[sidStr] = time.Now().Add(365 * 24 * time.Hour)
 	mu.Unlock()
+	
 	addLog(r, "系统登录", fmt.Sprintf("通过 GitHub 登录成功 (%s)", userData.Login))
 	secureCookie := isMasterTLS || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{Name: "sid", Value: sidStr, Path: "/", HttpOnly: true, Secure: secureCookie, MaxAge: 31536000, SameSite: http.SameSiteLaxMode})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+
 func handle2FAGenerate(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
+	mu.Lock()
 	u := config.WebUser
-	mu.RUnlock()
+	mu.Unlock()
 	key, _ := totp.Generate(totp.GenerateOpts{Issuer: "GoRelay-Pro", AccountName: u})
 	var buf bytes.Buffer
 	img, _ := qr.Encode(key.URL(), qr.M, qr.Auto)
@@ -2385,7 +2395,9 @@ func handleAddRule(w http.ResponseWriter, r *http.Request) {
 	if lbStrategy == "" {
 		lbStrategy = "random"
 	}
+
 	finalBridgePort := fmt.Sprintf("%d", 20000+time.Now().UnixNano()%30000)
+
 	mu.Lock()
 	rules = append(rules, LogicalRule{
 		ID:           fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -2416,6 +2428,7 @@ func handleEditRule(w http.ResponseWriter, r *http.Request) {
 	if lbStrategy == "" {
 		lbStrategy = "random"
 	}
+
 	mu.Lock()
 	for i := range rules {
 		if rules[i].ID == id {
@@ -2470,7 +2483,7 @@ func handleResetTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 	saveConfigNoLock()
 	mu.Unlock()
-	go pushConfigToAll()
+	go pushConfigToAll() 
 	http.Redirect(w, r, "/#rules", http.StatusSeeOther)
 }
 
@@ -2496,12 +2509,14 @@ func handleBatchRule(w http.ResponseWriter, r *http.Request) {
 	}
 	action := r.FormValue("action")
 	ids := strings.Split(r.FormValue("ids"), ",")
+
 	idMap := make(map[string]bool)
 	for _, id := range ids {
 		if id != "" {
 			idMap[id] = true
 		}
 	}
+
 	mu.Lock()
 	if action == "delete" {
 		var nr []LogicalRule
@@ -2529,7 +2544,8 @@ func handleBatchRule(w http.ResponseWriter, r *http.Request) {
 	}
 	saveConfigNoLock()
 	mu.Unlock()
-	go pushConfigToAll()
+
+	go pushConfigToAll() 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
@@ -2540,7 +2556,7 @@ func handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		if a.IsOnline {
 			json.NewEncoder(a.Conn).Encode(Message{Type: "uninstall"})
 		}
-		delete(agents, name)
+		delete(agents, name) // 点击卸载时才彻底删除
 	}
 	mu.Unlock()
 	http.Redirect(w, r, "/#dashboard", http.StatusSeeOther)
@@ -2550,10 +2566,12 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		return
 	}
+
 	mu.Lock()
 	oldPanelDomain := config.PanelDomain
 	oldMasterDomain := config.MasterDomain
 	oldPorts := config.AgentPorts
+
 	if p := r.FormValue("password"); p != "" {
 		salt := generateSalt()
 		config.WebPass = salt + "$" + hashPassword(p, salt)
@@ -2566,28 +2584,35 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	config.GithubClientID = r.FormValue("github_client_id")
 	config.GithubClientSecret = r.FormValue("github_client_secret")
 	config.GithubAllowedUsers = r.FormValue("github_allowed_users")
-	config.R2AccessKey = r.FormValue("r2_access_key")
+    config.R2AccessKey = r.FormValue("r2_access_key")
 	config.R2SecretKey = r.FormValue("r2_secret_key")
 	config.R2Endpoint = r.FormValue("r2_endpoint")
 	config.R2Bucket = r.FormValue("r2_bucket")
+	
 	if rd := r.FormValue("traffic_reset_day"); rd != "" {
 		d, _ := strconv.Atoi(rd)
-		if d < 0 || d > 31 {
-			d = 0
-		}
+		if d < 0 || d > 31 { d = 0 }
 		config.TrafficResetDay = d
 	} else {
 		config.TrafficResetDay = 0
 	}
+
 	saveConfigNoLock()
+	
 	newPanelDomain := config.PanelDomain
 	newMasterDomain := config.MasterDomain
 	newPorts := config.AgentPorts
 	mu.Unlock()
 
 	needRestart := (oldPanelDomain != newPanelDomain) || (oldMasterDomain != newMasterDomain) || (oldPorts != newPorts)
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "need_restart": needRestart, "redirect_host": newPanelDomain})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"need_restart":  needRestart,
+		"redirect_host": newPanelDomain,
+	})
+
 	if needRestart {
 		go func() {
 			time.Sleep(1 * time.Second)
@@ -2605,34 +2630,55 @@ func handleUploadConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		return
 	}
+
 	file, _, err := r.FormFile("db_file")
 	if err != nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "读取上传文件失败"})
 		return
 	}
 	defer file.Close()
+
+	// 1. 获取锁，安全地清理旧数据库连接
 	mu.Lock()
+
 	if db != nil {
 		db.Close()
 		db = nil
 	}
+
 	os.Remove(DBFile + "-wal")
 	os.Remove(DBFile + "-shm")
+
 	out, err := os.Create(DBFile)
 	if err != nil {
-		mu.Unlock()
+		mu.Unlock() // 发生错误必须解锁
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "无法覆盖写入新文件"})
 		return
 	}
+
+	// 2. 覆盖写入新数据
 	io.Copy(out, file)
-	out.Close()
+	out.Close() // 必须显式关闭文件句柄
+
+	// 3. 重新初始化数据库连接
 	initDB()
+	
+	// 4. 解锁！必须在 loadConfig 之前解锁，避免内部循环锁死锁
 	mu.Unlock()
+
+	// 5. 将新数据库中的配置重新加载到内存中
 	loadConfig()
-	mu.RLock()
+
+	// 获取恢复后的新面板域名
+	mu.Lock()
 	newPanelDomain := config.PanelDomain
-	mu.RUnlock()
-	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "redirect_host": newPanelDomain})
+	mu.Unlock()
+
+	// 6. 响应前端成功，并下发新的重定向域名
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"redirect_host": newPanelDomain,
+	})
 }
 
 func handleExportLogs(w http.ResponseWriter, r *http.Request) {
@@ -2658,12 +2704,12 @@ func handleClearLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if db != nil {
+		// 清空 logs 表
 		_, err := db.Exec("DELETE FROM logs")
 		if err == nil {
+			// 重置自增 ID (SQLite 特定语法)
 			db.Exec("DELETE FROM sqlite_sequence WHERE name='logs'")
-			logMu.Lock()
-			recentLogs = make([]OpLog, 0, MaxLogEntries)
-			logMu.Unlock()
+			// 添加一条清空操作的记录
 			addLog(r, "清理日志", "管理员手动清空了所有操作日志")
 		}
 	}
@@ -2671,8 +2717,8 @@ func handleClearLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleExportRules(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
+	mu.Lock()
+	defer mu.Unlock()
 	b, err := json.MarshalIndent(rules, "", "  ")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2693,16 +2739,20 @@ func handleImportRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+
 	var importedRules []LogicalRule
 	if err := json.NewDecoder(file).Decode(&importedRules); err != nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "解析 JSON 格式失败，请确保文件正确"})
 		return
 	}
+
 	mu.Lock()
 	rules = importedRules
 	saveConfigNoLock()
 	mu.Unlock()
+
 	go pushConfigToAll()
+
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
@@ -2731,32 +2781,15 @@ func handleUpdateSystem(w http.ResponseWriter, r *http.Request) {
 
 func handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
-	mu.RLock()
+	mu.Lock()
 	agent, ok := agents[name]
-	mu.RUnlock()
+	mu.Unlock()
 	if !ok {
 		http.Error(w, "Agent not found", 404)
 		return
 	}
 	json.NewEncoder(agent.Conn).Encode(Message{Type: "upgrade"})
 	w.Write([]byte("ok"))
-}
-
-func handleUpdateAllAgents(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		return
-	}
-	mu.RLock()
-	count := 0
-	for _, agent := range agents {
-		if agent.IsOnline {
-			json.NewEncoder(agent.Conn).Encode(Message{Type: "upgrade"})
-			count++
-		}
-	}
-	mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": count})
 }
 
 func handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
@@ -2767,6 +2800,7 @@ func handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
 	var data struct {
 		TagName string `json:"tag_name"`
 	}
@@ -2774,15 +2808,24 @@ func handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{"has_update": false})
 		return
 	}
+
 	remoteVer := strings.TrimPrefix(data.TagName, "v")
 	currentVer := strings.TrimPrefix(AppVersion, "v")
+
 	hasUpdate := remoteVer != currentVer
-	json.NewEncoder(w).Encode(map[string]interface{}{"has_update": hasUpdate, "latest_version": data.TagName, "current": AppVersion})
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"has_update":     hasUpdate,
+		"latest_version": data.TagName,
+		"current":        AppVersion,
+	})
 }
 
 func doRestart() {
 	log.Println("🔄 接收到重启指令...")
+
 	services := []string{"relay", "gorelay"}
+
 	if _, err := os.Stat("/run/systemd/system"); err == nil {
 		for _, s := range services {
 			if _, err := os.Stat(fmt.Sprintf("/etc/systemd/system/%s.service", s)); err == nil {
@@ -2793,6 +2836,7 @@ func doRestart() {
 			}
 		}
 	}
+
 	if _, err := os.Stat("/etc/init.d"); err == nil {
 		for _, s := range services {
 			if _, err := os.Stat(fmt.Sprintf("/etc/init.d/%s", s)); err == nil {
@@ -2803,6 +2847,7 @@ func doRestart() {
 			}
 		}
 	}
+
 	argv0, err := os.Executable()
 	if err != nil {
 		argv0 = os.Args[0]
@@ -2820,21 +2865,19 @@ func doRestart() {
 // ================= AGENT CORE =================
 
 func runAgent(name, masterAddr, token string) {
+	// --- 新增：精准探测公网 IPv4 / IPv6 ---
 	var publicIPv4, publicIPv6 string
 	client4 := http.Client{Timeout: 3 * time.Second}
 	if resp, err := client4.Get("http://ipv4.icanhazip.com"); err == nil {
-		if b, err := io.ReadAll(resp.Body); err == nil {
-			publicIPv4 = strings.TrimSpace(string(b))
-		}
+		if b, err := io.ReadAll(resp.Body); err == nil { publicIPv4 = strings.TrimSpace(string(b)) }
 		resp.Body.Close()
 	}
 	client6 := http.Client{Timeout: 3 * time.Second}
 	if resp, err := client6.Get("http://ipv6.icanhazip.com"); err == nil {
-		if b, err := io.ReadAll(resp.Body); err == nil {
-			publicIPv6 = strings.TrimSpace(string(b))
-		}
+		if b, err := io.ReadAll(resp.Body); err == nil { publicIPv6 = strings.TrimSpace(string(b)) }
 		resp.Body.Close()
 	}
+	// ------------------------------------
 
 	for {
 		var conn net.Conn
@@ -2856,19 +2899,21 @@ func runAgent(name, masterAddr, token string) {
 			continue
 		}
 
+		// --- 新增：开启临时测试端口，供主控测试入站连通性 ---
 		testLn, _ := net.Listen("tcp", ":0")
 		var testPort int
 		if testLn != nil {
 			testPort = testLn.Addr().(*net.TCPAddr).Port
 			go func(ln net.Listener) {
 				defer ln.Close()
+				// 10 秒后自动关闭测试端口，防止端口泄露
 				ln.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Second))
-				if c, err := ln.Accept(); err == nil {
-					c.Close()
-				}
+				if c, err := ln.Accept(); err == nil { c.Close() }
 			}(testLn)
 		}
+		// -------------------------------------------------
 
+		// 修改：将 IPv4、IPv6 和 测试端口 一并发送，Payload 类型改为 interface{}
 		json.NewEncoder(conn).Encode(Message{Type: "auth", Payload: map[string]interface{}{
 			"name": name, "token": token, "ipv4": publicIPv4, "ipv6": publicIPv6, "test_port": testPort, "version": AppVersion,
 		}})
@@ -2879,10 +2924,6 @@ func runAgent(name, masterAddr, token string) {
 			h := time.NewTicker(20 * time.Second)
 			defer t.Stop()
 			defer h.Stop()
-
-			// === 终极优化：提升 Encoder 至循环外部，复用对象防止 GC ===
-			enc := json.NewEncoder(conn)
-
 			for {
 				select {
 				case <-stop:
@@ -2902,9 +2943,9 @@ func runAgent(name, masterAddr, token string) {
 						return true
 					})
 					if len(reps) > 0 {
-						enc.Encode(Message{Type: "stats", Payload: reps})
+						json.NewEncoder(conn).Encode(Message{Type: "stats", Payload: reps})
 					}
-					enc.Encode(Message{Type: "ping", Payload: getSysStatus()})
+					json.NewEncoder(conn).Encode(Message{Type: "ping", Payload: getSysStatus()})
 				case <-h.C:
 					checkTargetHealth(conn)
 				}
@@ -2938,17 +2979,7 @@ func runAgent(name, masterAddr, token string) {
 				active := make(map[string]bool)
 				for _, t := range tasks {
 					active[t.ID] = true
-
-					// 已优化：Zero-Allocation 切分处理
-					rawTargets := strings.Split(t.Target, ",")
-					var cleanTargets []string
-					for _, tg := range rawTargets {
-						tg = strings.TrimSpace(tg)
-						if tg != "" {
-							cleanTargets = append(cleanTargets, tg)
-						}
-					}
-					activeTargets.Store(t.ID, cleanTargets)
+					activeTargets.Store(t.ID, t.Target)
 
 					if oldVal, loaded := activeTasks.LoadOrStore(t.ID, t); loaded {
 						oldTask := oldVal.(ForwardTask)
@@ -2993,15 +3024,18 @@ func doPing(address string) (int64, bool) {
 			return -1, false
 		}
 	}
+
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.Command("ping", "-n", "1", "-w", "1000", host)
 	} else {
 		cmd = exec.Command("ping", "-c", "1", "-W", "1", host)
 	}
+
 	start := time.Now()
 	err = cmd.Run()
 	latency := time.Since(start).Milliseconds()
+
 	if err != nil {
 		return -1, false
 	}
@@ -3010,83 +3044,68 @@ func doPing(address string) (int64, bool) {
 
 func checkTargetHealth(conn net.Conn) {
 	var results []HealthReport
-	var muResults sync.Mutex
-	var wg sync.WaitGroup
-
 	activeTargets.Range(func(key, value interface{}) bool {
-		tid := key.(string)
-		targets := value.([]string)
+		checkMode := "tcp"
+		if tVal, ok := activeTasks.Load(key); ok {
+			if t, ok := tVal.(ForwardTask); ok {
+				if t.Protocol == "udp" {
+					checkMode = "ping"
+				} else if t.Protocol == "both" {
+					checkMode = "mixed"
+				}
+			}
+		}
 
-		wg.Add(1)
-		go func(taskID string, tgList []string) {
-			defer wg.Done()
-			checkMode := "tcp"
-			if tVal, ok := activeTasks.Load(taskID); ok {
-				if t, ok := tVal.(ForwardTask); ok {
-					if t.Protocol == "udp" {
-						checkMode = "ping"
-					} else if t.Protocol == "both" {
-						checkMode = "mixed"
-					}
+		targets := strings.Split(value.(string), ",")
+		var bestLat int64 = -1
+
+		for _, target := range targets {
+			target = strings.TrimSpace(target)
+			if target == "" {
+				continue
+			}
+
+			var success bool
+			var lat int64
+
+			if checkMode == "ping" {
+				lat, success = doPing(target)
+			} else if checkMode == "mixed" {
+				start := time.Now()
+				c, err := net.DialTimeout("tcp", target, 2*time.Second)
+				if err == nil {
+					c.Close()
+					lat = time.Since(start).Milliseconds()
+					success = true
+				} else {
+					lat, success = doPing(target)
+				}
+			} else {
+				start := time.Now()
+				c, err := net.DialTimeout("tcp", target, 2*time.Second)
+				if err == nil {
+					c.Close()
+					lat = time.Since(start).Milliseconds()
+					success = true
+				} else {
+					success = false
 				}
 			}
 
-			var bestLat int64 = -1
-			var latMu sync.Mutex
-			var subWg sync.WaitGroup
-
-			for _, target := range tgList {
-				subWg.Add(1)
-				go func(tg string) {
-					defer subWg.Done()
-					var success bool
-					var lat int64
-
-					if checkMode == "ping" {
-						lat, success = doPing(tg)
-					} else if checkMode == "mixed" {
-						start := time.Now()
-						c, err := net.DialTimeout("tcp", tg, 2*time.Second)
-						if err == nil {
-							c.Close()
-							lat = time.Since(start).Milliseconds()
-							success = true
-						} else {
-							lat, success = doPing(tg)
-						}
-					} else {
-						start := time.Now()
-						c, err := net.DialTimeout("tcp", tg, 2*time.Second)
-						if err == nil {
-							c.Close()
-							lat = time.Since(start).Milliseconds()
-							success = true
-						} else {
-							success = false
-						}
-					}
-
-					if success {
-						latMu.Lock()
-						if bestLat == -1 || lat < bestLat {
-							bestLat = lat
-						}
-						latMu.Unlock()
-						targetHealthMap.Store(tg, lat)
-					} else {
-						targetHealthMap.Store(tg, int64(-1))
-					}
-				}(target)
+			if success {
+				if bestLat == -1 || lat < bestLat {
+					bestLat = lat
+				}
+				targetHealthMap.Store(target, lat)
+			} else {
+				targetHealthMap.Store(target, int64(-1))
 			}
-			subWg.Wait()
-			muResults.Lock()
-			results = append(results, HealthReport{TaskID: taskID, Latency: bestLat})
-			muResults.Unlock()
-		}(tid, targets)
+		}
+
+		results = append(results, HealthReport{TaskID: key.(string), Latency: bestLat})
 		return true
 	})
 
-	wg.Wait()
 	if len(results) > 0 {
 		_ = json.NewEncoder(conn).Encode(Message{Type: "health", Payload: results})
 	}
@@ -3114,10 +3133,13 @@ func (t *IpTracker) Remove(addr string) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	if count, exists := t.refs[host]; !exists || count <= 0 {
 		return
 	}
+
 	t.refs[host]--
+
 	if t.refs[host] <= 0 {
 		delete(t.refs, host)
 		if atomic.LoadInt64(t.count) > 0 {
@@ -3146,13 +3168,9 @@ func startProxy(t ForwardTask) {
 		}
 	}
 	runningListeners.Store(t.ID, closeAll)
-	vUz, _ := agentUserCounts.Load(t.ID)
-	userCountPtr := vUz.(*int64)
+	v, _ := agentUserCounts.Load(t.ID)
+	userCountPtr := v.(*int64)
 	ipTracker := &IpTracker{refs: make(map[string]int), count: userCountPtr}
-
-	// === 终极优化：透传 TrafficCounter 指针，消除查表开销 ===
-	vCnt, _ := agentTraffic.Load(t.ID)
-	cnt := vCnt.(*TrafficCounter)
 
 	if t.Protocol == "tcp" || t.Protocol == "both" {
 		go func() {
@@ -3178,8 +3196,7 @@ func startProxy(t ForwardTask) {
 				l.Unlock()
 				ipTracker.Add(c.RemoteAddr().String())
 				go func(conn net.Conn) {
-					// 传入指针 cnt
-					pipeTCP(conn, t.ID, t.SpeedLimit, t.LBStrategy, cnt)
+					pipeTCP(conn, t.ID, t.SpeedLimit, t.LBStrategy)
 					l.Lock()
 					delete(activeConns, conn)
 					l.Unlock()
@@ -3195,15 +3212,10 @@ func startProxy(t ForwardTask) {
 			if err != nil {
 				return
 			}
-			done := make(chan struct{})
 			l.Lock()
-			closers = append(closers, func() {
-				ln.Close()
-				close(done)
-			})
+			closers = append(closers, func() { ln.Close() })
 			l.Unlock()
-			// 传入指针 cnt
-			handleUDP(ln, t.ID, ipTracker, t.SpeedLimit, t.LBStrategy, done, cnt)
+			handleUDP(ln, t.ID, ipTracker, t.SpeedLimit, t.LBStrategy)
 		}()
 	}
 }
@@ -3238,6 +3250,7 @@ func selectTarget(tid string, targets []string, strategy string) string {
 		c := v.(*uint64)
 		idx := atomic.AddUint64(c, 1) % uint64(len(valid))
 		return valid[idx]
+
 	case "least_conn":
 		var best string
 		var minConn int64 = -1
@@ -3253,6 +3266,7 @@ func selectTarget(tid string, targets []string, strategy string) string {
 			best = valid[0]
 		}
 		return best
+
 	case "fastest":
 		var best string
 		var minLat int64 = -1
@@ -3267,30 +3281,24 @@ func selectTarget(tid string, targets []string, strategy string) string {
 			best = valid[0]
 		}
 		return best
+
 	default:
 		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(valid))))
 		return valid[n.Int64()]
 	}
 }
 
-func pipeTCP(src net.Conn, tid string, limit int64, strategy string, cnt *TrafficCounter) {
+func pipeTCP(src net.Conn, tid string, limit int64, strategy string) {
 	defer src.Close()
 
-	// === 终极优化：TCP 底层调优 (关闭 Nagle 并开启 KeepAlive) ===
-	if tcpSrc, ok := src.(*net.TCPConn); ok {
-		tcpSrc.SetNoDelay(true)
-		tcpSrc.SetKeepAlive(true)
-		tcpSrc.SetKeepAlivePeriod(30 * time.Second)
-	}
-	// =======================================================
-
-	var allTargets []string
+	var targetStr string
 	if v, ok := activeTargets.Load(tid); ok {
-		allTargets = v.([]string)
+		targetStr = v.(string)
 	} else {
 		return
 	}
 
+	allTargets := strings.Split(targetStr, ",")
 	bestTarget := selectTarget(tid, allTargets, strategy)
 
 	vConn, _ := connCounters.LoadOrStore(bestTarget, new(int64))
@@ -3303,42 +3311,30 @@ func pipeTCP(src net.Conn, tid string, limit int64, strategy string, cnt *Traffi
 	}
 	defer dst.Close()
 
-	// === 终极优化：TCP 底层调优 ===
-	if tcpDst, ok := dst.(*net.TCPConn); ok {
-		tcpDst.SetNoDelay(true)
-		tcpDst.SetKeepAlive(true)
-		tcpDst.SetKeepAlivePeriod(30 * time.Second)
-	}
-	// ===========================
-
+	v, _ := agentTraffic.Load(tid)
+	cnt := v.(*TrafficCounter)
 	go copyCount(dst, src, &cnt.Tx, limit)
 	copyCount(src, dst, &cnt.Rx, limit)
 }
 
-func handleUDP(ln *net.UDPConn, tid string, tracker *IpTracker, limit int64, strategy string, done chan struct{}, cnt *TrafficCounter) {
-	// === 终极优化：读写锁分离 + 零分配 Struct Key 代替并发 Map，彻底消灭热点 GC ===
-	var sessionsMu sync.RWMutex
-	udpSessions := make(map[udpClientKey]*udpSession)
+func handleUDP(ln *net.UDPConn, tid string, tracker *IpTracker, limit int64, strategy string) {
+	udpSessions := &sync.Map{}
+	v, _ := agentTraffic.Load(tid)
+	cnt := v.(*TrafficCounter)
 
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
 		for {
-			select {
-			case <-done:
-				return
-			case now := <-ticker.C:
-				sessionsMu.Lock()
-				for key, s := range udpSessions {
-					if now.Sub(s.lastActive) > 45*time.Second {
-						s.conn.Close()
-						delete(udpSessions, key)
-						ipStr := net.IP(key.IP[:]).String()
-						tracker.Remove(fmt.Sprintf("%s:%d", ipStr, key.Port))
-					}
+			time.Sleep(30 * time.Second)
+			now := time.Now()
+			udpSessions.Range(func(key, value interface{}) bool {
+				s := value.(*udpSession)
+				if now.Sub(s.lastActive) > 45*time.Second {
+					s.conn.Close()
+					udpSessions.Delete(key)
+					tracker.Remove(key.(string))
 				}
-				sessionsMu.Unlock()
-			}
+				return true
+			})
 		}
 	}()
 
@@ -3351,28 +3347,21 @@ func handleUDP(ln *net.UDPConn, tid string, tracker *IpTracker, limit int64, str
 			break
 		}
 		atomic.AddInt64(&cnt.Tx, int64(n))
-
-		// 构建零分配 Map Key
-		var key udpClientKey
-		key.Port = srcAddr.Port
-		if ip16 := srcAddr.IP.To16(); ip16 != nil {
-			copy(key.IP[:], ip16)
-		}
-
-		sessionsMu.RLock()
-		s, exists := udpSessions[key]
-		sessionsMu.RUnlock()
-
-		if exists {
+		sAddr := srcAddr.String()
+		val, ok := udpSessions.Load(sAddr)
+		if ok {
+			s := val.(*udpSession)
 			s.lastActive = time.Now()
 			s.conn.Write(buf[:n])
 		} else {
-			var targets []string
+
+			var currentTargetStr string
 			if v, ok := activeTargets.Load(tid); ok {
-				targets = v.([]string)
+				currentTargetStr = v.(string)
 			} else {
 				continue
 			}
+			targets := strings.Split(currentTargetStr, ",")
 
 			bestTarget := selectTarget(tid, targets, strategy)
 
@@ -3386,15 +3375,10 @@ func handleUDP(ln *net.UDPConn, tid string, tracker *IpTracker, limit int64, str
 				continue
 			}
 			s := &udpSession{conn: newConn, lastActive: time.Now()}
-			
-			sessionsMu.Lock()
-			udpSessions[key] = s
-			sessionsMu.Unlock()
-			
-			tracker.Add(srcAddr.String())
+			udpSessions.Store(sAddr, s)
+			tracker.Add(sAddr)
 			newConn.Write(buf[:n])
-			
-			go func(c *net.UDPConn, sa *net.UDPAddr, k udpClientKey, bt string) {
+			go func(c *net.UDPConn, sa *net.UDPAddr, k string, bt string) {
 				bPtr := bufPool.Get().(*[]byte)
 				defer bufPool.Put(bPtr)
 				b := *bPtr
@@ -3403,19 +3387,15 @@ func handleUDP(ln *net.UDPConn, tid string, tracker *IpTracker, limit int64, str
 					m, _, e := c.ReadFromUDP(b)
 					if e != nil {
 						c.Close()
-						sessionsMu.Lock()
-						delete(udpSessions, k)
-						sessionsMu.Unlock()
-						
-						ipStr := net.IP(k.IP[:]).String()
-						tracker.Remove(fmt.Sprintf("%s:%d", ipStr, k.Port))
+						udpSessions.Delete(k)
+						tracker.Remove(k)
 						atomic.AddInt64(vConn.(*int64), -1)
 						break
 					}
 					ln.WriteToUDP(b[:m], sa)
 					atomic.AddInt64(&cnt.Rx, int64(m))
 				}
-			}(newConn, srcAddr, key, bestTarget)
+			}(newConn, srcAddr, sAddr, bestTarget)
 		}
 	}
 }
@@ -3424,22 +3404,19 @@ func copyCount(dst io.Writer, src io.Reader, c *int64, limit int64) {
 	bufPtr := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufPtr)
 	buf := *bufPtr
-
-	var limiter *rate.Limiter
-	if limit > 0 {
-		limiter = rate.NewLimiter(rate.Limit(limit), 32*1024)
-	}
-
-	ctx := context.Background()
 	for {
 		nr, err := src.Read(buf)
 		if nr > 0 {
-			if limiter != nil {
-				_ = limiter.WaitN(ctx, nr)
-			}
+			start := time.Now()
 			nw, _ := dst.Write(buf[0:nr])
 			if nw > 0 {
 				atomic.AddInt64(c, int64(nw))
+			}
+			if limit > 0 {
+				exp := time.Duration(1e9 * int64(nr) / limit)
+				if act := time.Since(start); exp > act {
+					time.Sleep(exp - act)
+				}
 			}
 		}
 		if err != nil {
@@ -3497,7 +3474,7 @@ func loadConfig() {
 				config.TrafficResetDay = d
 			case "last_reset_month":
 				config.LastResetMonth = v
-			case "r2_access_key":
+            case "r2_access_key":
 				config.R2AccessKey = v
 			case "r2_secret_key":
 				config.R2SecretKey = v
@@ -3567,7 +3544,7 @@ func saveConfigNoLock() {
 	setS("github_allowed_users", conf.GithubAllowedUsers)
 	setS("traffic_reset_day", strconv.Itoa(conf.TrafficResetDay))
 	setS("last_reset_month", conf.LastResetMonth)
-	setS("r2_access_key", conf.R2AccessKey)
+    setS("r2_access_key", conf.R2AccessKey)
 	setS("r2_secret_key", conf.R2SecretKey)
 	setS("r2_endpoint", conf.R2Endpoint)
 	setS("r2_bucket", conf.R2Bucket)
@@ -3575,18 +3552,10 @@ func saveConfigNoLock() {
 	_, _ = tx.Exec("DELETE FROM rules")
 	for _, r := range lRules {
 		d, a80, a95, a100 := 0, 0, 0, 0
-		if r.Disabled {
-			d = 1
-		}
-		if r.Alert80 {
-			a80 = 1
-		}
-		if r.Alert95 {
-			a95 = 1
-		}
-		if r.Alert100 {
-			a100 = 1
-		}
+		if r.Disabled { d = 1 }
+		if r.Alert80 { a80 = 1 }
+		if r.Alert95 { a95 = 1 }
+		if r.Alert100 { a100 = 1 }
 
 		_, _ = tx.Exec(`INSERT INTO rules (id, group_name, note, entry_agent, entry_port, exit_agent, target_ip, target_port, protocol, bridge_port, traffic_limit, disabled, speed_limit, total_tx, total_rx, lb_strategy, alert_80, alert_95, alert_100) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			r.ID, r.Group, r.Note, r.EntryAgent, r.EntryPort, r.ExitAgent, r.TargetIP, r.TargetPort, r.Protocol, r.BridgePort, r.TrafficLimit, d, r.SpeedLimit, r.TotalTx, r.TotalRx, r.LBStrategy, a80, a95, a100)
@@ -5455,10 +5424,7 @@ input:focus, select:focus {
             <div class="card">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
                     <h3 style="margin:0"><i class="ri-server-line"></i> 在线节点状态</h3>
-                    <div style="display:flex; gap: 8px;">
-                        <button class="btn warning" style="font-size:13px; padding: 6px 12px;" onclick="updateAllAgents()" title="一键更新所有在线节点"><i class="ri-rocket-line"></i> 全部更新</button>
-                        <button class="btn icon secondary" onclick="refreshSection('agents', this)" title="局部刷新"><i class="ri-refresh-line"></i></button>
-                    </div>
+                    <button class="btn icon secondary" onclick="refreshSection('agents', this)" title="局部刷新"><i class="ri-refresh-line"></i></button>
                 </div>
                 <div class="table-container" id="agents-container">
                     {{if .Agents}}
@@ -6158,26 +6124,6 @@ input:focus, select:focus {
         });
     }
 
-	function updateAllAgents() {
-        showConfirm("全部更新", "确定要远程更新 <b>所有在线节点</b> 吗？<br><br><span style='font-size:12px;color:var(--text-sub)'>这会导致所有节点的连接短暂中断，节点将自动下载最新版本并重启。</span>", "warning", () => {
-            fetch('/update_all_agents', {method: 'POST'})
-            .then(r => r.json())
-            .then(d => {
-                if(d.success) {
-                    if(d.count > 0) {
-                        // 【修复点】：使用普通双引号拼接，避免打断 Go 的反引号常量
-                        showToast("更新指令已发送至 " + d.count + " 个在线节点", "success");
-                    } else {
-                        showToast("当前没有在线的节点可更新", "warn");
-                    }
-                } else {
-                    showToast("发送失败", "warn");
-                }
-            })
-            .catch(() => showToast("请求发送失败", "warn"));
-        });
-    }
-
     function delAgent(name) { showConfirm("卸载节点", "节点 <b>"+name+"</b> 将自毁，确定吗？", "danger", () => location.href="/delete_agent?name="+name); }
 
     function toggleTheme() {
@@ -6484,57 +6430,46 @@ input:focus, select:focus {
     Chart.defaults.font.family = "'Inter', sans-serif";
     Chart.defaults.color = '#94a3b8';
     
-    // --- 1. 实时流量图 (加深极光渐变，隐藏网格) ---
     var ctx = document.getElementById('trafficChart').getContext('2d');
     var txGrad = ctx.createLinearGradient(0, 0, 0, 300);
-    txGrad.addColorStop(0, 'rgba(16, 185, 129, 0.45)'); // 加深渐变，增强玻璃质感
-    txGrad.addColorStop(1, 'rgba(16, 185, 129, 0)');
+    txGrad.addColorStop(0, 'rgba(16, 185, 129, 0.25)'); txGrad.addColorStop(1, 'rgba(16, 185, 129, 0)');
     
     var rxGrad = ctx.createLinearGradient(0, 0, 0, 300);
-    rxGrad.addColorStop(0, 'rgba(6, 182, 212, 0.45)'); 
-    rxGrad.addColorStop(1, 'rgba(6, 182, 212, 0)');
+    rxGrad.addColorStop(0, 'rgba(6, 182, 212, 0.25)'); rxGrad.addColorStop(1, 'rgba(6, 182, 212, 0)');
 
     var chart = new Chart(ctx, {
         type: 'line',
-        data: { labels: Array(30).fill(''), datasets: [ { label: 'Tx', data: Array(30).fill(0), borderColor: '#10b981', backgroundColor: txGrad, borderWidth: 3, pointRadius: 0, fill: true, tension: 0.4 }, { label: 'Rx', data: Array(30).fill(0), borderColor: '#06b6d4', backgroundColor: rxGrad, borderWidth: 3, pointRadius: 0, fill: true, tension: 0.4 } ] },
-        options: { 
-            responsive: true, maintainAspectRatio: false, 
-            plugins: { 
-                legend: { display: false }, 
-                tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(15, 23, 42, 0.85)', titleColor: '#f9fafb', bodyColor: '#d1d5db', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1, padding: 12, displayColors: true, cornerRadius: 10, callbacks: { label: function(context) { return context.dataset.label + ': ' + context.raw + ' MB/s'; } } } 
-            }, 
-            scales: { 
-                x: { display: false }, 
-                y: { beginAtZero: true, border: { display: false }, grid: { display: false }, ticks: { callback: v => v + ' MB/s', font: {size: 10}, maxTicksLimit: 5 } } 
-            }, 
-            interaction: { mode: 'nearest', axis: 'x', intersect: false } 
-        }
+        data: { labels: Array(30).fill(''), datasets: [ { label: 'Tx', data: Array(30).fill(0), borderColor: '#10b981', backgroundColor: txGrad, borderWidth: 2.5, pointRadius: 0, fill: true, tension: 0.4 }, { label: 'Rx', data: Array(30).fill(0), borderColor: '#06b6d4', backgroundColor: rxGrad, borderWidth: 2.5, pointRadius: 0, fill: true, tension: 0.4 } ] },
+        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(3, 7, 18, 0.95)', titleColor: '#f9fafb', bodyColor: '#d1d5db', borderColor: 'rgba(16, 185, 129, 0.2)', borderWidth: 1, padding: 12, displayColors: true, cornerRadius: 10, callbacks: { label: function(context) { return context.dataset.label + ': ' + context.raw + ' MB/s'; } } } }, scales: { x: { display: false }, y: { beginAtZero: true, grid: { color: 'rgba(128, 128, 128, 0.06)', borderDash: [4, 4] }, ticks: { callback: v => v + ' MB/s', font: {size: 10}, maxTicksLimit: 5 } } }, interaction: { mode: 'nearest', axis: 'x', intersect: false } }
     });
 
-    // --- 2. 流量分布饼图 (调整中空比例与悬浮动画) ---
     var ctxPie = document.getElementById('pieChart').getContext('2d');
     var pieChart = new Chart(ctxPie, {
         type: 'doughnut',
-        data: { labels: [], datasets: [{ data: [], backgroundColor: ['#10b981', '#06b6d4', '#f59e0b', '#8b5cf6', '#3b82f6'], borderWidth: 0, hoverOffset: 8 }] },
+        data: { labels: [], datasets: [{ data: [], backgroundColor: ['#10b981', '#06b6d4', '#f59e0b', '#8b5cf6', '#3b82f6'], borderWidth: 0, hoverOffset: 6 }] },
         options: { 
-            responsive: true, maintainAspectRatio: false, 
+            responsive: true, 
+            maintainAspectRatio: false, 
             plugins: { 
                 legend: { position: 'bottom', labels: { boxWidth: 10, usePointStyle: true, padding: 20, font: {size: 11} } },
-                tooltip: { backgroundColor: 'rgba(15, 23, 42, 0.85)', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1, padding: 12, cornerRadius: 10, callbacks: { label: function(context) { return context.label + ': ' + context.raw + ' GB'; } } }
+                tooltip: { callbacks: { label: function(context) { return context.label + ': ' + context.raw + ' GB'; } } }
             }, 
-            cutout: '78%' // 更细的环形，看起来更高级
+            cutout: '72%' 
         }
     });
 
-    // --- 3. 近 30 天流量图 (保留你的切换逻辑，彻底隐藏网格) ---
+    // 初始化近 30 天流量柱状图
     var dailyStatsData = {{.DailyStatsJSON}};
     var ctxDaily = document.getElementById('dailyChart').getContext('2d');
+    
+    // 从 localStorage 读取用户的图表偏好，默认为柱状图
     var dailyChartType = localStorage.getItem('dailyChartType') || 'bar';
     
+    // 生成渐变色彩（用于曲线图的底部填充）
     var txGradDaily = ctxDaily.createLinearGradient(0, 0, 0, 250);
-    txGradDaily.addColorStop(0, 'rgba(16, 185, 129, 0.4)'); txGradDaily.addColorStop(1, 'rgba(16, 185, 129, 0)');
+    txGradDaily.addColorStop(0, 'rgba(16, 185, 129, 0.3)'); txGradDaily.addColorStop(1, 'rgba(16, 185, 129, 0)');
     var rxGradDaily = ctxDaily.createLinearGradient(0, 0, 0, 250);
-    rxGradDaily.addColorStop(0, 'rgba(6, 182, 212, 0.4)'); rxGradDaily.addColorStop(1, 'rgba(6, 182, 212, 0)');
+    rxGradDaily.addColorStop(0, 'rgba(6, 182, 212, 0.3)'); rxGradDaily.addColorStop(1, 'rgba(6, 182, 212, 0)');
 
     var dailyChart = new Chart(ctxDaily, {
         type: dailyChartType,
@@ -6549,33 +6484,39 @@ input:focus, select:focus {
             responsive: true, maintainAspectRatio: false,
             plugins: { 
                 legend: { display: true, position: 'top', labels: {color: '#94a3b8', font: {size: 11, weight: 500}, usePointStyle: true, boxWidth: 10, padding: 20} }, 
-                tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(15, 23, 42, 0.85)', titleColor: '#f9fafb', bodyColor: '#d1d5db', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1, padding: 12, cornerRadius: 10, callbacks: { label: function(c) { return c.dataset.label + ': ' + formatBytes(c.raw); } } } 
+                tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(3, 7, 18, 0.95)', titleColor: '#f9fafb', bodyColor: '#d1d5db', borderColor: 'rgba(16, 185, 129, 0.2)', borderWidth: 1, padding: 12, cornerRadius: 10,
+                    callbacks: { label: function(c) { return c.dataset.label + ': ' + formatBytes(c.raw); } } 
+                } 
             },
             scales: { 
-                x: { stacked: true, border: { display: false }, grid: {display: false}, ticks: {color: '#94a3b8', font: {size: 10}} }, 
-                y: { stacked: true, border: { display: false }, grid: { display: false }, ticks: { color: '#94a3b8', callback: v => formatBytes(v), maxTicksLimit: 6, font: {size: 10} } } 
+                x: { stacked: true, grid: {display: false}, ticks: {color: '#94a3b8', font: {size: 10}} }, 
+                y: { stacked: true, grid: { color: 'rgba(128, 128, 128, 0.06)', borderDash: [4, 4] }, ticks: { color: '#94a3b8', callback: v => formatBytes(v), maxTicksLimit: 6, font: {size: 10} } } 
             },
             interaction: { mode: 'index', axis: 'x', intersect: false }
         }
     });
 
+    // 动态应用图表样式和属性
     function applyDailyChartState() {
         if (dailyChartType === 'line') {
+            // 曲线图专属美化
             dailyChart.data.datasets[0].borderColor = '#10b981';
             dailyChart.data.datasets[0].backgroundColor = txGradDaily;
-            dailyChart.data.datasets[0].borderWidth = 3;
+            dailyChart.data.datasets[0].borderWidth = 2;
             dailyChart.data.datasets[0].fill = true;
             dailyChart.data.datasets[0].tension = 0.4;
             
             dailyChart.data.datasets[1].borderColor = '#06b6d4';
             dailyChart.data.datasets[1].backgroundColor = rxGradDaily;
-            dailyChart.data.datasets[1].borderWidth = 3;
+            dailyChart.data.datasets[1].borderWidth = 2;
             dailyChart.data.datasets[1].fill = true;
             dailyChart.data.datasets[1].tension = 0.4;
             
+            // 取消坐标轴堆叠，保证曲线图时重合部分的趋势能清晰辨认
             dailyChart.options.scales.x.stacked = false;
             dailyChart.options.scales.y.stacked = false;
         } else {
+            // 柱状图专属美化
             dailyChart.data.datasets[0].backgroundColor = '#10b981';
             dailyChart.data.datasets[0].borderWidth = 0;
             dailyChart.data.datasets[0].fill = false;
@@ -6584,32 +6525,35 @@ input:focus, select:focus {
             dailyChart.data.datasets[1].borderWidth = 0;
             dailyChart.data.datasets[1].fill = false;
 
+            // 恢复柱状图的堆叠模式
             dailyChart.options.scales.x.stacked = true;
             dailyChart.options.scales.y.stacked = true;
         }
         
+        // 更新 UI 图标：当前为圆柱则按钮提示切换到曲线，反之亦然
         const toggleIcon = document.getElementById('dailyChartToggleIcon');
         const titleIcon = document.getElementById('dailyChartTitleIcon');
         if (toggleIcon) toggleIcon.className = dailyChartType === 'bar' ? 'ri-line-chart-line' : 'ri-bar-chart-grouped-line';
         if (titleIcon) titleIcon.className = dailyChartType === 'bar' ? 'ri-bar-chart-grouped-line' : 'ri-line-chart-line';
+        
         dailyChart.update();
     }
     
+    // 用户触发图表切换事件
     function toggleDailyChart() {
         dailyChartType = dailyChartType === 'bar' ? 'line' : 'bar';
         localStorage.setItem('dailyChartType', dailyChartType);
         dailyChart.config.type = dailyChartType;
         applyDailyChartState();
     }
+    
+    // 初始化图表最终状态
     applyDailyChartState();
 
     function updateChartTheme(theme) {
-        // 网格线已移除，只需切换文字颜色
-        const textColor = theme === 'dark' ? '#94a3b8' : '#64748b';
-        Chart.defaults.color = textColor;
-        chart.update();
-        if(dailyChart) dailyChart.update();
-        if(pieChart) pieChart.update();
+        const gridColor = theme === 'dark' ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.05)';
+        chart.options.scales.y.grid.color = gridColor; chart.update();
+        if(dailyChart) { dailyChart.options.scales.y.grid.color = gridColor; dailyChart.update(); }
     }
 
     function formatBytes(b) {
