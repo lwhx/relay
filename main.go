@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -34,6 +33,7 @@ import (
 	"syscall"
 	"time"
     "context" 
+	"golang.org/x/time/rate"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
@@ -48,7 +48,7 @@ import (
 // --- 配置与常量 ---
 
 const (
-	AppVersion      = "v3.3.1"
+	AppVersion      = "v3.2.8"
 	DBFile          = "data.db"
 	WebPort         = ":8888"
 	DownloadURL     = "https://jht126.eu.org/https://github.com/jinhuaitao/relay/releases/latest/download/relay"
@@ -1479,6 +1479,7 @@ func runMaster() {
 	http.HandleFunc("/restart", authMiddleware(handleRestart))
 	http.HandleFunc("/update_sys", authMiddleware(handleUpdateSystem))
 	http.HandleFunc("/update_agent", authMiddleware(handleUpdateAgent))
+	http.HandleFunc("/update_all_agents", authMiddleware(handleUpdateAllAgents))
 	http.HandleFunc("/check_update", authMiddleware(handleCheckUpdate))
 	http.HandleFunc("/gen_agent_token", authMiddleware(handleGenAgentToken))
 	
@@ -1674,6 +1675,8 @@ func broadcastLoop() {
 			wsMu.Unlock()
 			continue
 		}
+		
+		// 1. 先构建好需要发送的消息对象 (这就是编译器之前找不到的 msg)
 		msg := WSMessage{
 			Type: "stats",
 			Data: WSDashboardData{
@@ -1685,8 +1688,17 @@ func broadcastLoop() {
 				Logs:         logData,
 			},
 		}
+
+		// 2. 在锁内，循环外部完成且仅完成一次 JSON 序列化
+		msgBytes, err := json.Marshal(msg)
+		if err != nil {
+			wsMu.Unlock()
+			continue
+		}
+
+		// 3. 遍历客户端发送原生 Byte 数据，极大节省 CPU 和内存分配
 		for client := range wsClients {
-			if err := client.WriteJSON(msg); err != nil {
+			if err := client.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
 				client.Close()
 				delete(wsClients, client)
 			}
@@ -1840,40 +1852,45 @@ func handleStatsReport(payload interface{}) {
 	mu.Lock()
 	defer mu.Unlock()
 	limitTriggered := false
+
+	// 构建 O(1) 快速索引映射，消除 O(N*M) 的双层嵌套遍历
+	ruleIndex := make(map[string]int, len(rules))
+	for i := range rules {
+		ruleIndex[rules[i].ID] = i
+	}
+
 	for _, rep := range reports {
 		if strings.HasSuffix(rep.TaskID, "_entry") {
 			rid := strings.TrimSuffix(rep.TaskID, "_entry")
-			for i := range rules {
-				if rules[i].ID == rid {
-					rules[i].TotalTx += rep.TxDelta
-					rules[i].TotalRx += rep.RxDelta
-					rules[i].UserCount = rep.UserCount
-					atomic.StoreInt32(&configDirty, 1)
+			
+			// 使用哈希映射直接定位规则
+			if i, exists := ruleIndex[rid]; exists {
+				rules[i].TotalTx += rep.TxDelta
+				rules[i].TotalRx += rep.RxDelta
+				rules[i].UserCount = rep.UserCount
+				atomic.StoreInt32(&configDirty, 1)
 
-					// 将增量数据记录到每日流量统计缓冲池中
-					atomic.AddInt64(&dailyTxBuf, rep.TxDelta)
-					atomic.AddInt64(&dailyRxBuf, rep.RxDelta)
+				atomic.AddInt64(&dailyTxBuf, rep.TxDelta)
+				atomic.AddInt64(&dailyRxBuf, rep.RxDelta)
 
-					// --- 智能预警机制开始 ---
-					limit := rules[i].TrafficLimit
-					total := rules[i].TotalTx + rules[i].TotalRx
-					if limit > 0 {
-						pct := float64(total) / float64(limit)
-						if pct >= 1.0 && !rules[i].Alert100 {
-							rules[i].Alert100 = true
-							sendTelegram(fmt.Sprintf("🚨 <b>流量耗尽熔断</b>\n\n规则：【%s】\n状态：已切断连接\n说明：流量达到 100%%，为了您的钱包安全，该端口已自动熔断！", rules[i].Note))
-							limitTriggered = true
-						} else if pct >= 0.95 && pct < 1.0 && !rules[i].Alert95 {
-							rules[i].Alert95 = true
-							sendTelegram(fmt.Sprintf("⚠️ <b>流量极高预警</b>\n\n规则：【%s】\n状态：即将熔断\n说明：流量已使用超过 95%%，请及时检查或重置流量！", rules[i].Note))
-						} else if pct >= 0.80 && pct < 0.95 && !rules[i].Alert80 {
-							rules[i].Alert80 = true
-							sendTelegram(fmt.Sprintf("🔔 <b>流量使用预警</b>\n\n规则：【%s】\n状态：运行中\n说明：流量已使用超过 80%%。", rules[i].Note))
-						}
+				// --- 智能预警机制开始 ---
+				limit := rules[i].TrafficLimit
+				total := rules[i].TotalTx + rules[i].TotalRx
+				if limit > 0 {
+					pct := float64(total) / float64(limit)
+					if pct >= 1.0 && !rules[i].Alert100 {
+						rules[i].Alert100 = true
+						sendTelegram(fmt.Sprintf("🚨 <b>流量耗尽熔断</b>\n\n规则：【%s】\n状态：已切断连接\n说明：流量达到 100%%，该端口已自动熔断！", rules[i].Note))
+						limitTriggered = true
+					} else if pct >= 0.95 && pct < 1.0 && !rules[i].Alert95 {
+						rules[i].Alert95 = true
+						sendTelegram(fmt.Sprintf("⚠️ <b>流量极高预警</b>\n\n规则：【%s】\n状态：即将熔断\n说明：流量已使用超过 95%%！", rules[i].Note))
+					} else if pct >= 0.80 && pct < 0.95 && !rules[i].Alert80 {
+						rules[i].Alert80 = true
+						sendTelegram(fmt.Sprintf("🔔 <b>流量使用预警</b>\n\n规则：【%s】\n状态：运行中\n说明：流量已使用超过 80%%。", rules[i].Note))
 					}
-					// --- 智能预警机制结束 ---
-					break
 				}
+				// --- 智能预警机制结束 ---
 			}
 		}
 	}
@@ -2792,6 +2809,29 @@ func handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+func handleUpdateAllAgents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		return
+	}
+	
+	mu.Lock()
+	count := 0
+	// 遍历所有节点，仅向在线节点发送更新指令
+	for _, agent := range agents {
+		if agent.IsOnline {
+			json.NewEncoder(agent.Conn).Encode(Message{Type: "upgrade"})
+			count++
+		}
+	}
+	mu.Unlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true, 
+		"count":   count,
+	})
+}
+
 func handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
 	client := http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(GithubLatestAPI)
@@ -3404,19 +3444,26 @@ func copyCount(dst io.Writer, src io.Reader, c *int64, limit int64) {
 	bufPtr := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufPtr)
 	buf := *bufPtr
+
+	// 初始化官方令牌桶限速器
+	var limiter *rate.Limiter
+	if limit > 0 {
+		// Limit(limit) 表示每秒允许的字节数，Burst 设为 32KB 应对缓冲区突发
+		limiter = rate.NewLimiter(rate.Limit(limit), 32*1024)
+	}
+
+	ctx := context.Background()
 	for {
 		nr, err := src.Read(buf)
 		if nr > 0 {
-			start := time.Now()
+			// 如果开启了限速，平滑消费令牌，替代粗暴的 time.Sleep
+			if limiter != nil {
+				_ = limiter.WaitN(ctx, nr)
+			}
+			
 			nw, _ := dst.Write(buf[0:nr])
 			if nw > 0 {
 				atomic.AddInt64(c, int64(nw))
-			}
-			if limit > 0 {
-				exp := time.Duration(1e9 * int64(nr) / limit)
-				if act := time.Since(start); exp > act {
-					time.Sleep(exp - act)
-				}
 			}
 		}
 		if err != nil {
@@ -5424,7 +5471,10 @@ input:focus, select:focus {
             <div class="card">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
                     <h3 style="margin:0"><i class="ri-server-line"></i> 在线节点状态</h3>
-                    <button class="btn icon secondary" onclick="refreshSection('agents', this)" title="局部刷新"><i class="ri-refresh-line"></i></button>
+                    <div style="display:flex; gap: 8px;">
+                        <button class="btn warning" style="font-size:13px; padding: 6px 12px;" onclick="updateAllAgents()" title="一键更新所有在线节点"><i class="ri-rocket-line"></i> 全部更新</button>
+                        <button class="btn icon secondary" onclick="refreshSection('agents', this)" title="局部刷新"><i class="ri-refresh-line"></i></button>
+                    </div>
                 </div>
                 <div class="table-container" id="agents-container">
                     {{if .Agents}}
@@ -6121,6 +6171,26 @@ input:focus, select:focus {
     function updateAgent(name) {
         showConfirm("更新节点", "确定要远程更新节点 <b>"+name+"</b> 吗？", "warning", () => {
             fetch('/update_agent?name='+name, {method: 'POST'}).then(r => { if(r.ok) showToast("指令已发送", "success"); else showToast("发送失败", "warn"); });
+        });
+    }
+
+	function updateAllAgents() {
+        showConfirm("全部更新", "确定要远程更新 <b>所有在线节点</b> 吗？<br><br><span style='font-size:12px;color:var(--text-sub)'>这会导致所有节点的连接短暂中断，节点将自动下载最新版本并重启。</span>", "warning", () => {
+            fetch('/update_all_agents', {method: 'POST'})
+            .then(r => r.json())
+            .then(d => {
+                if(d.success) {
+                    if(d.count > 0) {
+                        // 【修复点】：使用普通双引号拼接，避免打断 Go 的反引号常量
+                        showToast("更新指令已发送至 " + d.count + " 个在线节点", "success");
+                    } else {
+                        showToast("当前没有在线的节点可更新", "warn");
+                    }
+                } else {
+                    showToast("发送失败", "warn");
+                }
+            })
+            .catch(() => showToast("请求发送失败", "warn"));
         });
     }
 
