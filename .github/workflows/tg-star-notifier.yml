@@ -23,7 +23,7 @@ jobs:
           # 2. 拼接消息内容，加入 $STARS 变量
           MSG_TEXT="🌟 <b>恭喜！你的项目有了新动态！</b>
           
-          👤 用户 <a href=\"https://github.com/${{ github.actor }}\">${{ github.actor }}</a> 刚刚 Star 了你的项目！
+          👤 用户 <a href=\"https://github.com/${{ github.actor }}\">${{ github.actor }}</a> 刚刚 Stars 了你的项目！
           📦 仓库：<a href=\"https://github.com/${{ github.repository }}\">${{ github.repository }}</a>
           📈 当前总 Stars 数：<b>${STARS}</b>"
           
@@ -33,7 +33,7 @@ jobs:
             --arg text "$MSG_TEXT" \
             '{chat_id: $chat_id, text: $text, parse_mode: "HTML", disable_web_page_preview: true}')
             
-          echo "获取到当前 Star 总数为: $STARS"
+          echo "获取到当前 Stars 总数为: $STARS"
           echo "正在发送请求到 Telegram..."
           
           # 4. 推送到 Telegram
