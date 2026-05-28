@@ -19,13 +19,13 @@ jobs:
           STARS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}" | jq '.stargazers_count')
           
-          # 2. 拼接消息内容，新增了直观的项目地址展示
+          # 2. 拼接消息内容（Star 数与地址位置已互换）
           MSG_TEXT="🌟 <b>恭喜！你的项目有了新动态！</b>
           
           👤 用户 <a href=\"https://github.com/${{ github.actor }}\">${{ github.actor }}</a> 刚刚 Star 了你的项目！
           📦 仓库：<b>${{ github.repository }}</b>
-          🌟 当前总 Star 数：<b>${STARS}</b>"
-          🔗 地址：<a href=\"https://github.com/${{ github.repository }}\">https://github.com/${{ github.repository }}</a>
+          🌟 当前总 Star 数：<b>${STARS}</b>
+          🔗 地址：<a href=\"https://github.com/${{ github.repository }}\">https://github.com/${{ github.repository }}</a>"
           
           # 3. 使用 jq 构建安全的 JSON 数据
           PAYLOAD=$(jq -n \
