@@ -1,9 +1,9 @@
 name: Telegram Star Notifier
 
-# 触发条件：有人 Star 时触发，或支持在 Actions 面板手动点击触发（方便调试）
+# 触发条件：有人点 Star (watch: started) 时触发，或支持在 Actions 面板手动点击触发
 on:
-  star:
-    types: [created]
+  watch:
+    types: [started]
   workflow_dispatch:
 
 jobs:
@@ -12,7 +12,6 @@ jobs:
     steps:
       - name: Send Message to Telegram
         env:
-          # 在这里替换为你要求的 Secret 名称
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_TO: ${{ secrets.TELEGRAM_TO }}
           MSG_TEXT: |
@@ -21,13 +20,12 @@ jobs:
             👤 用户 <a href="https://github.com/${{ github.actor }}">${{ github.actor }}</a> 刚刚 Star 了你的项目！
             📦 仓库：<a href="https://github.com/${{ github.repository }}">${{ github.repository }}</a>
         run: |
-          # 使用新的变量名 TELEGRAM_TO 传递给 jq
+          # 使用 jq 抓取环境变量并构建安全的 JSON 数据
           PAYLOAD=$(jq -n \
             --arg chat_id "$TELEGRAM_TO" \
             '{chat_id: $chat_id, text: env.MSG_TEXT, parse_mode: "HTML", disable_web_page_preview: true}')
             
           echo "正在发送请求到 Telegram..."
-          # 使用新的变量名 TELEGRAM_TOKEN 构建 URL
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD"
