@@ -12,22 +12,22 @@ jobs:
     steps:
       - name: Send Message to Telegram
         env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # 将消息设为环境变量，结合 HTML 解析，彻底告别 Markdown 的转义报错
+          # 在这里替换为你要求的 Secret 名称
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_TO: ${{ secrets.TELEGRAM_TO }}
           MSG_TEXT: |
             🌟 <b>恭喜！你的项目有了新动态！</b>
             
             👤 用户 <a href="https://github.com/${{ github.actor }}">${{ github.actor }}</a> 刚刚 Star 了你的项目！
             📦 仓库：<a href="https://github.com/${{ github.repository }}">${{ github.repository }}</a>
         run: |
-          # 使用 jq 抓取环境变量并构建安全的 JSON 数据
+          # 使用新的变量名 TELEGRAM_TO 传递给 jq
           PAYLOAD=$(jq -n \
-            --arg chat_id "$TG_CHAT_ID" \
+            --arg chat_id "$TELEGRAM_TO" \
             '{chat_id: $chat_id, text: env.MSG_TEXT, parse_mode: "HTML", disable_web_page_preview: true}')
             
-          # 打印发送状态，方便在 GitHub Actions 日志中排查问题
           echo "正在发送请求到 Telegram..."
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+          # 使用新的变量名 TELEGRAM_TOKEN 构建 URL
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD"
