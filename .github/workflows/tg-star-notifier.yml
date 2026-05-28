@@ -25,7 +25,7 @@ jobs:
           
           👤 用户 <a href=\"https://github.com/${{ github.actor }}\">${{ github.actor }}</a> 刚刚 Star 了你的项目！
           📦 仓库：<a href=\"https://github.com/${{ github.repository }}\">${{ github.repository }}</a>
-          📈 当前总 Star 数：<b>${STARS}</b>"
+          📈 当前总 Stars 数：<b>${STARS}</b>"
           
           # 3. 使用 jq 构建安全的 JSON 数据
           PAYLOAD=$(jq -n \
